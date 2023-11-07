@@ -13,8 +13,10 @@
             "args": [
                 "-u=https://0a6600f103f6dd658270ba3600d90006.web-security-academy.net/product?productId=2",
                 "-r=request.txt",
-                "-q='version()'",
-                "-d=postgresql"
+                "-q=version()",
+                "-d=postgresql",
+                "-c=\"Welcome back\" in response.text",
+                "--proxy=http://127.0.0.1:8080"
             ],
             "justMyCode": true
         }

