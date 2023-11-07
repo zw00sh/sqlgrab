@@ -1,7 +1,7 @@
+Extracts string data from a conditional SQLi vulnerability using a binary search tree approach.
+
 ```
 usage: sqlgrab.py [-h] -u HOST -r REQUEST -q QUERY -d {mysql,mssql,oracle,postgresql} -c CONDITION [--delay DELAY] [--urlencode] [--proxy PROXY]
-
-Extracts string data from a conditional SQLi vulnerability using a binary search tree approach.
 
 options:
   -h, --help            show this help message and exit
