@@ -87,11 +87,11 @@ class SqlGrab:
             print(f'\n{result}')
 
         except RuntimeError:
-            print('The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.', file=sys.stderr)
+            print('[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.', file=sys.stderr)
         except Exception as e:
             print(e)
         except KeyboardInterrupt:
-            print('Interrupted')
+            print('\n[!] Interrupted')
 
     def isMatch(self, response):  # Change me to whatever condition counts as True
         return eval(self.condition, locals())
