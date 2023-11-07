@@ -16,4 +16,4 @@ options:
   --delay DELAY         Delay in seconds to add between requests. Optional. E.g. 1, 0.2
   --urlencode           Perform URL-encoding on the payloads. Optional. E.g. True, False
   --proxy PROXY         Proxy to use, e.g. http://127.0.0.1:8080
-  ```
+```
