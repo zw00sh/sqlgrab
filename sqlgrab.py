@@ -236,7 +236,7 @@ if __name__ == "__main__":
                         choices=['mysql', 'mssql', 'oracle', 'postgresql'])
     parser.add_argument('-c', '--condition', required=True,
                         help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\'')
-    parser.add_argument('--delay', required=False, default=0,
+    parser.add_argument('--delay', required=False, default=0, type=int,
                         help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
     parser.add_argument('--urlencode', required=False, action='store_false',
                         help='Perform URL-encoding on the payloads. Optional. E.g. True, False')
