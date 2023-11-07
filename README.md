@@ -1,3 +1,5 @@
+![sqlgrab in action](https://github.com/zw00sh/sqlgrab/blob/main/sqlgrab.png?raw=true)
+
 Extracts string data from a conditional SQLi vulnerability using a binary search tree approach.
 
 ```
