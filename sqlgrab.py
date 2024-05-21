@@ -170,7 +170,10 @@ class SqlGrab:
             payload))  # URL payload will always be urlencoded
 
         if prepared.body:
-            prepared.body.format(payload=payload)
+            body = prepared.body.decode('utf-8')
+            body = body.replace("{payload}", payload)
+            prepared.body = body.encode('utf-8')
+            prepared.headers['Content-Length'] = str(len(prepared.body))
 
         prepared.headers = dict([(k, v.format(payload=payload))
                                 for k, v in prepared.headers.items()])
@@ -208,7 +211,7 @@ class SqlGrab:
 
             if tag in request.url:
                 self.locations.append('url')
-            if request.data and tag in request.data:
+            if request.data and tag in str(request.data):
                 self.locations.append('body')
             for key, value in request.headers._headers:
                 if tag in key:
@@ -239,7 +242,7 @@ if __name__ == "__main__":
                         choices=['mysql', 'mssql', 'oracle', 'postgresql'])
     parser.add_argument('-c', '--condition', required=True,
                         help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\'')
-    parser.add_argument('--delay', required=False, default=0, type=int,
+    parser.add_argument('--delay', required=False, default=0, type=float,
                         help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
     parser.add_argument('--urlencode', required=False, action='store_false',
                         help='Perform URL-encoding on the payloads. Optional. E.g. True, False')
