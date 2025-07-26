@@ -1,8 +1,7 @@
-from requests import Request, Response, Session, PreparedRequest
+from requests import Request, Session, PreparedRequest
 from typing import Literal
 import time
 import math
-from abc import ABC, abstractmethod
 import urllib.parse
 import urllib3
 import argparse
@@ -101,15 +100,15 @@ PROFILES = {
 class SqlGrab:
     def __init__(
             self,
-            host: str,
-            request: str,
+            request: Request,
             dbms: Literal['mysql', 'mssql', 'oracle', 'postgresql', 'databricks'],
             condition: str,
-            delay: float,
-            urlencode: bool,
-            sanity: bool,
+            delay: float=0,
+            urlencode: bool=False,
+            sanity: bool=False,
             proxy: str | None = None
         ):
+        self.request = request
         self.urlencode = urlencode
         self.sanity = sanity
         self.delay = delay
@@ -119,7 +118,15 @@ class SqlGrab:
             'http': proxy,
             'https': proxy
         } if proxy else {}
-        self.request = self.parseRequest(host, request)
+
+    @classmethod
+    def fromFile(
+            cls: 'SqlGrab', host: str, request: str, **kwargs
+        ) -> 'SqlGrab':
+        return cls(
+            request=cls.parseRequest(host, request),
+            **kwargs
+        )
 
     def grab(self, query: str) -> str:
         print(f'[+] Grabbing: \'{query}\'')
@@ -139,7 +146,7 @@ class SqlGrab:
             self.parent = parent
             self.query = query
             self.result = ''
-            self.status = '[+] Initialising...'
+            self.status = ''
 
         def grab(self) -> str:
             self.length = self.getLength()
@@ -256,7 +263,8 @@ class SqlGrab:
     
         return self.isMatch(response)
 
-    def parseRequest(self, hostname: str, filename: str) -> Request:
+    @staticmethod
+    def parseRequest(hostname: str, filename: str) -> Request:
         ''' Parses a raw HTTP request from file and verifies it contains at least one {payload} tag. Creates a HTTPRequest from the parsed content. '''
         with open(filename, 'rb') as fp:
             parser = HTTPRequest(fp.read())
@@ -266,11 +274,11 @@ class SqlGrab:
                     f'Error parsing request file: {parser.error_message}')
 
             target = '{uri.scheme}://{uri.netloc}'.format(uri=urllib.parse.urlparse(hostname))
-            self.url = f'{target}{parser.path}'
+            url = f'{target}{parser.path}'
 
             request = Request(
                 method=parser.command,
-                url=self.url,
+                url=url,
                 headers=parser.headers,
                 data=parser.rfile.read(),
             )
@@ -311,7 +319,7 @@ if __name__ == "__main__":
 
     args = vars(parser.parse_args())
     q = args.pop('query')
-    grabber = SqlGrab(
+    grabber = SqlGrab.fromFile(
         **args
     )
     result = grabber.grab(q)
