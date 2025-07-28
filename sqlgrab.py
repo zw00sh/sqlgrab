@@ -106,7 +106,8 @@ class SqlGrab:
             delay: float=0,
             urlencode: bool=False,
             sanity: bool=False,
-            proxy: str | None = None
+            proxy: str | None = None,
+            output: bool=False
         ):
         self.request = request
         self.urlencode = urlencode
@@ -114,6 +115,7 @@ class SqlGrab:
         self.delay = delay
         self.payloadSets = PROFILES[dbms]
         self.condition = condition
+        self.output=output
         self.proxy = {
             'http': proxy,
             'https': proxy
@@ -129,7 +131,8 @@ class SqlGrab:
         )
 
     def grab(self, query: str) -> str:
-        print(f'[+] Grabbing: \'{query}\'')
+        if self.output:
+            print(f'[+] Grabbing: \'{query}\'')
         self.session = Session()
         grabber = SqlGrab.Grabber(parent=self, query=query)
         try:
@@ -153,7 +156,8 @@ class SqlGrab:
             return self.getString()
         
         def update(self) -> None:
-            print(self.status.format(**self.__dict__), end='\r')
+            if self.parent.output:
+                print(self.status.format(**self.__dict__), end='\r')
 
         # by the time this function is called, the payload string should only require 1 sub
         def getValue(self, guess: int, bigger: str, equal: str, range=(0, math.inf) ):
@@ -217,7 +221,6 @@ class SqlGrab:
             )
             if not self.parent.evaluate(compare):
                 raise RuntimeError('[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.')
-            print()
             return self.result
 
     @staticmethod
@@ -296,8 +299,7 @@ class SqlGrab:
                     locations.append(f'{key} header value')
 
             if not locations:
-                raise Exception(
-                    '[!] The parsed request file does not contain a \'{payload}\' tag. Add the string \'{payload}\' within the request file at the injection point.')
+                raise Exception('[!] The parsed request file does not contain a \'{payload}\' tag. Add the string \'{payload}\' within the request file at the injection point.')
 
             print(f'[+] Target: {target}, Payload location(s): {", ".join(locations)}')
             return request
@@ -320,7 +322,8 @@ if __name__ == "__main__":
     args = vars(parser.parse_args())
     q = args.pop('query')
     grabber = SqlGrab.fromFile(
-        **args
+        **args,
+        output=True
     )
     result = grabber.grab(q)
     print(f'\n{result}\n')
