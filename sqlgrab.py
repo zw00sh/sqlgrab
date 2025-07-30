@@ -1,14 +1,13 @@
-import string
-import threading
 from requests import Request, Session, PreparedRequest
 from typing import Callable, Literal
-from concurrent.futures import ALL_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
 from dataclasses import dataclass
 import time
 from queue import Queue, ShutDown
+from datetime import datetime
 import math
 import urllib.parse
 import urllib3
@@ -116,6 +115,7 @@ class SqlGrab:
     urlencode: bool=False
     proxy: str | None = None
     output: bool=False
+    requests: int = 0
 
     def __post_init__(self):
         self.payloads = PROFILES[self.dbms]
@@ -152,8 +152,14 @@ class SqlGrab:
             payloads=self.payloads,
             query=query
         )
+        start = datetime.now()
         length = self._get_length()
-        return self._get_string(length)
+        result = self._get_string(length)
+        elapsed = datetime.now() - start
+        if self.output:
+            print(f'[+] Sent {self.requests} requests in {elapsed.total_seconds()} seconds')
+
+        return result
 
     def _get_length(self) -> int:
         payloads = self.payloads['length']
@@ -188,7 +194,7 @@ class SqlGrab:
         def update(c: SqlGrab.ValueGrabber.Context):
             results[c.task_id] = c
             done = [i for i, f in enumerate(futures) if f.done()]
-            output = f'[+] \x1B[90m[{str(len(done))}/{str(len(results))}]\x1B[0m '
+            output = f'\x1B[90m[{str(len(done))}/{str(len(results))}]\x1B[0m '
             for r in results:
                 output += (
                     f'\x1B[90m-\x1B[0m' if r == None else
@@ -318,6 +324,7 @@ class SqlGrab:
             proxies =self.proxy,
             verify=False
         )
+        self.requests += 1
         time.sleep(self.delay)
     
         return self.isMatch(response)
