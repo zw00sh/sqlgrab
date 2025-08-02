@@ -113,6 +113,11 @@ PROFILES = {
     'databricks': DATABRICKS_PAYLOADS
 }
 
+@dataclass
+class IntegrityError(RuntimeError):
+    message: str
+    partial_result: str
+
 class SafeDict(dict):
     def __missing__(self, key):
         return '{' + key + '}'
@@ -200,7 +205,7 @@ class RowGrabber:
         result = ''.join([chr(r) for r in results])
         
         if not self.parent.evaluate(p(self.payloads['compare'], guess=result)):
-            raise RuntimeError(ERR_SANITY_CHECK)
+            raise IntegrityError(message=ERR_SANITY_CHECK, partial_result=result)
 
         return result
 
@@ -304,15 +309,16 @@ class SqlGrab:
         )
         start = datetime.now()
         self.num_rows = self._get_count()
-        if self.output: print(f'[+] Found: {self.num_rows} rows', end='\033[K\n')
+        if self.output: print(f'[+] Found {self.num_rows} rows', end='\033[K\n')
         results = []
         row_grabber = RowGrabber(parent=self)
         has_error = False
         for row in range(self.num_rows):
             try:
                 results.append(row_grabber.grab(row))
-            except RuntimeError as e:
+            except IntegrityError as e:
                 has_error = True
+                results.append(e.partial_result)
             if self.output: print()
         elapsed = datetime.now() - start
         if self.output:
@@ -392,8 +398,7 @@ class SqlGrab:
             parser = HTTPRequest(fp.read())
             locations = []
             if parser.error_code:
-                raise RuntimeError(
-                    f'Error parsing request file: {parser.error_message}')
+                raise RuntimeError(f'Error parsing request file: {parser.error_message}')
 
             target = '{uri.scheme}://{uri.netloc}'.format(uri=urllib.parse.urlparse(hostname))
             url = f'{target}{parser.path}'
