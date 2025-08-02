@@ -311,9 +311,9 @@ class SqlGrab:
         for row in range(self.num_rows):
             try:
                 results.append(row_grabber.grab(row))
-                if self.output: print()
             except RuntimeError as e:
                 has_error = True
+            if self.output: print()
         elapsed = datetime.now() - start
         if self.output:
             print(f'[+] Sent {self.requests} requests in {elapsed.total_seconds()} seconds')
