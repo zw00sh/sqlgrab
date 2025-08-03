@@ -382,6 +382,7 @@ class SqlGrab:
                 )
                 work.append( (row, progress, future) )
             
+            has_error = False
             for row, progress, future in work:
                 has_error = False
                 futures: list[Future] = future.result()
