@@ -119,9 +119,12 @@ PROFILES = {
 }
 
 @dataclass
-class IntegrityError(RuntimeError):
+class IntegrityError(Exception):
     message: str
-    partial_result: str
+
+@dataclass
+class UpperBoundReachedError(Exception):
+    message: str
 
 class SafeDict(dict):
     def __missing__(self, key):
@@ -141,7 +144,7 @@ def _make_payloads(payloads: dict, **kwargs) -> dict[str|dict]:
     return new
 
 @dataclass
-class Value:
+class Progress:
     min: int | None = None
     max: int | None = None
     guess: int | None = None
@@ -154,8 +157,12 @@ class ValueGrabber:
     bigger: str
     equals: str
     eval_func: Callable 
-    progress: Value | None = None
+    progress: Progress | None = None
     range: tuple[int,int] = (0,math.inf)
+
+    def __post_init__(self):
+        if self.progress == None:
+            self.progress = Progress
 
     def grab(self, guess: int) -> int:
         ''' Determines the value of a variable based on iterative halving/doubling of the search space '''
@@ -175,22 +182,21 @@ class ValueGrabber:
             else: # narrow down between that range
                 guess = min + int((max - min) / 2)
             
-            if self.progress:
-                self.progress.started = True     
-                self.progress.min = min
-                self.progress.max = max
-                self.progress.guess = guess
+            self.progress.started = True     
+            self.progress.min = min
+            self.progress.max = max
+            self.progress.guess = guess
 
             if guess > 2**32:
-                raise RuntimeError(ERR_UPPER_BOUND)
-            
-        if self.eval_func(self.equals.format(guess=guess)):
-            if self.progress:
-                self.progress.done = True
-        else:
-            if self.progress:
                 self.progress.errored = True
-            raise RuntimeError(ERR_SANITY_CHECK)
+                raise UpperBoundReachedError(ERR_UPPER_BOUND)
+            
+        is_sane_result = self.eval_func(self.equals.format(guess=guess))
+        if is_sane_result:
+            self.progress.done = True
+        else:
+            self.progress.errored = True
+            raise IntegrityError(ERR_SANITY_CHECK)
         return guess
 
 @dataclass
@@ -214,7 +220,7 @@ class RowGrabber:
     def get_futures(self, length: int) -> list[Future]:
         payloads: dict[str, str] = self.payloads['character']
         for _ in range(length):
-            self.progress.append(Value())
+            self.progress.append(Progress())
         futures = [self.parent.work_queue.enqueue(
             priority=self.row,
             work=ValueGrabber(
@@ -313,7 +319,7 @@ class SqlGrab:
             **kwargs
         )
     
-    def _count_update(self, context: Value, _):
+    def _count_update(self, context: Progress, _):
             print(f'[+] \x1B[90mDetermining result row count (between {context.min} and {context.max})\x1B[0m\033[K', end='\033[K\r')
 
     def _get_count(self) -> int:
@@ -331,7 +337,7 @@ class SqlGrab:
         return future.result()
     
 
-    def _update_string(self, progress: list[Value]) -> str:
+    def _update_string(self, progress: list[Progress]) -> str:
         done = [r for r in progress if r and r.done]
         output = f'\x1B[90m[{len(done)}/{len(progress)}]\x1B[0m '
         for v in progress:
@@ -363,9 +369,8 @@ class SqlGrab:
             if self.output: print(f'[+] Found {num_rows} rows', end='\033[K\n')
 
             results = []
-            has_error = False
 
-            work: list[tuple[int, list[Value|None], Future]] = []
+            work: list[tuple[int, list[Progress|None], Future]] = []
             for row in range(num_rows):
                 progress = []
                 future = self.work_queue.enqueue(
@@ -375,6 +380,7 @@ class SqlGrab:
                 work.append( (row, progress, future) )
             
             for row, progress, future in work:
+                has_error = False
                 futures: list[Future] = future.result()
                 if self.output: # progress message
                     while not all(f.done() for f in futures):
@@ -383,16 +389,22 @@ class SqlGrab:
                 # await the current row
                 try:
                     result = ''.join([chr(f.result()) for f in futures])
-                except IntegrityError as e:
-                    result = e.partial_result
+                except IntegrityError:
+                    result = ''.join([chr(p.guess) for p in progress])
                     has_error = True
+                except UpperBoundReachedError:
+                    has_error = True
+                    continue
+
                 # sanity check
-                if not self.evaluate(p(self.payloads['compare'], guess=result)):
+                if not self.evaluate(p(self.payloads['compare'], guess=result, row=row)):
                     has_error = True
 
                 results.append(result)
                 if has_error and self.output: print(f'[!] ', end='')
-                if self.output: print(output, end='\033[K\n')
+                if self.output:
+                    output = f'[{row + 1}/{num_rows}] {self._update_string(progress)}'
+                    print(output, end='\033[K\n')
 
             elapsed = datetime.now() - start
             if self.output:
@@ -401,10 +413,9 @@ class SqlGrab:
                 if has_error: print(ERR_SANITY_CHECK)
         except Exception as e:
             print(f'[!] {e}')
-            return results
         finally:
             self.work_queue.shutdown()
-        
+        return results
 
     @staticmethod
     def urlEncode(text: str) -> str:
