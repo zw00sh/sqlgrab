@@ -3,9 +3,9 @@ from typing import Callable, Literal
 from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
-from functools import partial
 from dataclasses import dataclass
 import time
+import string
 from threading import Lock
 from queue import Queue, PriorityQueue
 from datetime import datetime
@@ -247,7 +247,6 @@ class RowGrabber:
         )
         return future.result()
 
-
 class PriorityWorkerQueue:
     def __init__(self, max_workers: int, debug=False):
         self._task_queue = PriorityQueue()
@@ -336,17 +335,20 @@ class SqlGrab:
         )
         return future.result()
     
-
     def _update_string(self, progress: list[Progress]) -> str:
         done = [r for r in progress if r and r.done]
         output = f'\x1B[90m[{len(done)}/{len(progress)}]\x1B[0m '
         for v in progress:
-            output += (
-                f'\x1B[90m-\x1B[0m' if not v.started else
-                f'\x1B[31m{chr(v.guess)}\x1B[0m' if v.errored else
-                f'\x1B[32m{chr(v.guess)}\x1B[0m' if v.done else
-                f'\x1b[90m{chr(v.guess)}\x1B[0m'
-            )
+            if not v.guess: 
+                output += f'\x1B[90m-\x1B[0m'
+            else:
+                char = chr(v.guess)
+                colour = '\x1B[31m' if v.errored else '\x1B[32m' if v.done else '\x1b[90m'
+                if char in string.printable:
+                    output += f'{colour}{char}'
+                else:
+                    char = f'\x1B[90m\\\x1B[0m{colour}{hex(v.guess)}' if char in string.printable else char
+                output += '\x1B[0m'
         return output
     
     def grab(self, query: str) -> list[str]:
