@@ -35,6 +35,7 @@ print_lock = Lock()
 CHAR_MIN = 0x20
 CHAR_MAX = 0x7E
 SAFE_CHARS = '/'
+INITIAL_COUNT = 4
 INITIAL_LENGTH = 16
 INITIAL_CHAR = ord('Z')
 ERR_SANITY_CHECK = 'The result was invalid, either due to a syntax error, too many threads, or because no result exists. Send the requests to Repeater and sanity check them.'
@@ -331,7 +332,7 @@ class SqlGrab:
                 eval_func=self.evaluate,
                 progress=self.progress_queue
             ).grab,
-            guess=INITIAL_LENGTH
+            guess=INITIAL_COUNT
         )
         return future.result()
     
@@ -444,9 +445,10 @@ class SqlGrab:
         if prepared.body:
             if self.urlencode:
                 payload = self.urlEncode(payload)
-            body = prepared.body.decode('utf-8')
+            is_str = type(prepared.body) == str
+            body = prepared.body if is_str else prepared.body.decode('utf-8')
             body = body.replace("{payload}", payload)
-            prepared.body = body.encode('utf-8')
+            prepared.body = body if is_str else body.encode('utf-8')
             prepared.headers['Content-Length'] = str(len(prepared.body))
 
         prepared.headers = dict([
