@@ -37,8 +37,8 @@ CHAR_MAX = 0x7E
 SAFE_CHARS = '/'
 INITIAL_LENGTH = 16
 INITIAL_CHAR = ord('Z')
-ERR_SANITY_CHECK = '[!] The result was invalid, either due to a syntax error, too many threads, or because no result exists. Send the requests to Repeater and sanity check them.'
-ERR_UPPER_BOUND = '[!] An upper bound on the output length could not be found. Maybe a syntax error?'
+ERR_SANITY_CHECK = 'The result was invalid, either due to a syntax error, too many threads, or because no result exists. Send the requests to Repeater and sanity check them.'
+ERR_UPPER_BOUND = 'An upper bound on the output length could not be found. Maybe a syntax error?'
 
 POSTGRESQL_PAYLOADS = { # avoids <, > and quotes
     'length': {
@@ -403,8 +403,8 @@ class SqlGrab:
                     has_error = True
 
                 results.append(result)
-                if has_error and self.output: print(f'[!] ', end='')
                 if self.output:
+                    if has_error: print(f'[!] ', end='')
                     output = f'[{row + 1}/{num_rows}] {self._update_string(progress)}'
                     print(output, end='\033[K\n')
 
@@ -413,11 +413,11 @@ class SqlGrab:
                 print(f'[+] Sent {self.requests_sent} requests in {elapsed.total_seconds()} seconds')
                 print('\n'.join(results))
                 if has_error: print(ERR_SANITY_CHECK)
+            return results
         except Exception as e:
             print(f'[!] {e}')
         finally:
             self.work_queue.shutdown()
-        return results
 
     @staticmethod
     def urlEncode(text: str) -> str:
